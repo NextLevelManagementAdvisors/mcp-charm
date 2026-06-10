@@ -5,7 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express";
 import { z } from "zod";
 
-const VERSION = "0.2.1";
+const VERSION = "0.2.2";
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
@@ -495,7 +495,11 @@ async function runHttp() {
   app.all("/mcp", async (req, res) => {
     if (token) {
       const auth = req.headers.authorization ?? "";
-      if (auth !== `Bearer ${token}`) {
+      const qpRaw = req.query.token;
+      const qp = Array.isArray(qpRaw) ? qpRaw[0] : qpRaw;
+      const headerOk = auth === `Bearer ${token}`;
+      const queryOk = typeof qp === "string" && qp === token;
+      if (!headerOk && !queryOk) {
         res.status(401).json({ error: "unauthorized" });
         return;
       }
