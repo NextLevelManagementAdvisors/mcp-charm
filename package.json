@@ -1,6 +1,6 @@
 {
   "name": "@nlma/lemon-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server for LEMON Manuals (lemon-manuals.la) — free car service/workshop manuals 1960-2025. Fork of @gonzih/mcp-charm.",
   "type": "module",
   "bin": {

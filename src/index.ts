@@ -5,7 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express";
 import { z } from "zod";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
@@ -53,6 +53,11 @@ function encodePath(path: string): string {
   return pathSegments(path)
     .map((seg) => encodeURIComponent(seg))
     .join("/");
+}
+
+// Case/hyphen/space-insensitive matching: "F-150" matches "F 150" and "f150".
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase().replace(/[-\s]+/g, "");
 }
 
 async function fetchUrl(target: string): Promise<{ html: string; finalUrl: string }> {
@@ -175,7 +180,7 @@ function buildServer(): McpServer {
       const links = extractLinks(html, finalUrl);
       const makes = links
         .filter((l) => l.segments.length === 1)
-        .map((l) => ({ name: l.text, url: l.url }));
+        .map((l) => ({ name: l.segments[0], url: l.url }));
       return {
         content: [
           {
@@ -215,7 +220,7 @@ function buildServer(): McpServer {
             l.segments[0].toLowerCase() === makeLower
         )
         .map((l) => ({
-          label: l.text,
+          label: l.segments[1],
           url: l.url,
           path: l.segments.join("/"),
         }));
@@ -245,12 +250,12 @@ function buildServer(): McpServer {
     "browse_manuals",
     {
       description:
-        'Browse manuals at a specific path on LEMON Manuals. Use paths like "Ford/2018" to see model+engine combos, or "Ford/2018/F 150 4WD V8-5.0L" to see manual sections (Repair and Diagnosis, Parts and Labor, TSBs, zip download).',
+        'Browse manuals at a specific path on LEMON Manuals. Use paths like "Ford/2018" to see model+engine combos, or "Ford/2018/F-150 4WD V8-5.0L" to see manual sections (Repair and Diagnosis, Parts and Labor, TSBs, zip download). Note: LEMON year pages nest models under folder headers; entry names here are derived from the full URL path, which is authoritative.',
       inputSchema: {
         path: z
           .string()
           .min(1)
-          .describe('Path within the site, e.g. "Ford/2018", "Toyota/2005", "Ford/2018/F 150 4WD V8-5.0L". No leading/trailing slashes.'),
+          .describe('Path within the site, e.g. "Ford/2018", "Toyota/2005". No leading/trailing slashes.'),
       },
     },
     async ({ path }) => {
@@ -263,7 +268,7 @@ function buildServer(): McpServer {
       const entries = links
         .filter((l) => isChild(l) && !/\.zip$/i.test(l.pathname))
         .map((l) => ({
-          name: l.text,
+          name: l.segments[l.segments.length - 1],
           url: l.url,
           path: l.segments.join("/"),
           type: "directory",
@@ -296,7 +301,7 @@ function buildServer(): McpServer {
     "search_manuals",
     {
       description:
-        "Search for service manuals by vehicle make and optional keyword. If the query includes a 4-digit year (e.g. '2018'), only that year is searched. Otherwise the 5 most recent available years are searched. Returns matching model/manual entries with URLs.",
+        "Search for service manuals by vehicle make and optional keyword. If the query includes a 4-digit year (e.g. '2018'), only that year is searched. Otherwise the 5 most recent available years are searched. Matching ignores case, hyphens, and spaces, so 'F-150', 'F 150', and 'f150' are equivalent. Returns matching model/manual entries with URLs.",
       inputSchema: {
         make: z
           .string()
@@ -340,7 +345,7 @@ function buildServer(): McpServer {
                   make,
                   query: null,
                   results: yearEntries.map((e) => ({
-                    label: e.text,
+                    label: e.segments[1],
                     url: e.url,
                     path: e.segments.join("/"),
                   })),
@@ -359,7 +364,7 @@ function buildServer(): McpServer {
       const yearMatch = query.match(/\b(19|20)\d{2}\b/);
       if (yearMatch) {
         const targetYear = yearMatch[0];
-        yearsToSearch = yearEntries.filter((e) => e.text === targetYear);
+        yearsToSearch = yearEntries.filter((e) => e.segments[1] === targetYear);
         if (yearsToSearch.length === 0) {
           return {
             content: [
@@ -370,7 +375,7 @@ function buildServer(): McpServer {
                     make,
                     query,
                     results: [],
-                    note: `Year ${targetYear} not found for ${make}. Available years: ${yearEntries.map((e) => e.text).join(", ")}`,
+                    note: `Year ${targetYear} not found for ${make}. Available years: ${yearEntries.map((e) => e.segments[1]).join(", ")}`,
                   },
                   null,
                   2
@@ -383,26 +388,28 @@ function buildServer(): McpServer {
         yearsToSearch = yearEntries.slice(-5);
       }
 
-      const keyword = query.replace(/\b(19|20)\d{2}\b/, "").trim().toLowerCase();
+      const keyword = query.replace(/\b(19|20)\d{2}\b/, "").trim();
+      const keywordNorm = normalizeForMatch(keyword);
       const results: Array<{ make: string; year: string; model: string; url: string; path: string }> = [];
 
       await Promise.all(
         yearsToSearch.map(async (yearEntry) => {
           try {
-            const dir = yearEntry.segments.join("/");
-            const { html: yh, finalUrl: yu } = await fetchDir(dir);
+            const year = yearEntry.segments[1];
+            const { html: yh, finalUrl: yu } = await fetchDir(yearEntry.segments.join("/"));
             const modelEntries = extractLinks(yh, yu).filter(
               (l) =>
                 l.segments.length === 3 &&
                 l.segments[0].toLowerCase() === makeLower &&
-                l.segments[1] === yearEntry.text
+                l.segments[1] === year
             );
             for (const entry of modelEntries) {
-              if (!keyword || entry.text.toLowerCase().includes(keyword)) {
+              const model = entry.segments[2];
+              if (!keywordNorm || normalizeForMatch(model).includes(keywordNorm)) {
                 results.push({
                   make,
-                  year: yearEntry.text,
-                  model: entry.text,
+                  year,
+                  model,
                   url: entry.url,
                   path: entry.segments.join("/"),
                 });
@@ -451,7 +458,7 @@ function buildServer(): McpServer {
         url: z
           .string()
           .url()
-          .describe("Full URL of a LEMON Manuals page, e.g. https://lemon-manuals.la/Ford/2018/F%20150%204WD%20V8-5.0L/. Must be on an allowed lemon-manuals domain."),
+          .describe("Full URL of a LEMON Manuals page, e.g. https://lemon-manuals.la/Ford/2018/F-150%204WD%20V8-5.0L/. Must be on an allowed lemon-manuals domain."),
       },
     },
     async ({ url }) => {
