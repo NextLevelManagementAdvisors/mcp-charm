@@ -1,14 +1,15 @@
 {
-  "name": "@gonzih/mcp-charm",
-  "version": "0.1.0",
-  "description": "MCP server for Operation CHARM — free car service manuals from charm.li",
+  "name": "@nlma/lemon-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for LEMON Manuals (lemon-manuals.la) — free car service/workshop manuals 1960-2025. Fork of @gonzih/mcp-charm.",
   "type": "module",
   "bin": {
-    "mcp-charm": "./dist/index.js"
+    "lemon-mcp": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:http": "node dist/index.js http",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -16,16 +17,19 @@
     "car",
     "service",
     "manuals",
+    "lemon",
     "charm",
-    "operation-charm",
     "automotive"
   ],
-  "author": "Gonzih",
+  "author": "NLMA (fork of Gonzih/mcp-charm)",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "express": "^4.21.2",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "22.15.3",
     "typescript": "5.8.3"
   },
@@ -37,10 +41,6 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/gonzih/mcp-charm.git"
-  },
-  "homepage": "https://github.com/gonzih/mcp-charm#readme",
-  "bugs": {
-    "url": "https://github.com/gonzih/mcp-charm/issues"
+    "url": "https://github.com/NextLevelManagementAdvisors/mcp-charm.git"
   }
 }

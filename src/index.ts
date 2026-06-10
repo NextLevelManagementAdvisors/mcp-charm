@@ -1,299 +1,187 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
 import { z } from "zod";
 
-const BASE_URL = "https://charm.li";
-const JINA_PREFIX = "https://r.jina.ai/";
+const VERSION = "0.2.0";
+const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
-/**
- * Fetch a charm.li page via jina.ai for clean markdown output.
- */
-async function fetchMarkdown(url: string): Promise<string> {
-  const jinaUrl = `${JINA_PREFIX}${url}`;
-  const response = await fetch(jinaUrl, {
-    headers: {
-      "User-Agent": "mcp-charm/0.1.0 (https://github.com/gonzih/mcp-charm)",
-      Accept: "text/plain",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}: HTTP ${response.status}`);
+// LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
+const BASES: string[] = (
+  process.env.LEMON_BASE_URLS ??
+  "https://lemon-manuals.la,https://lemon-manuals.org.ua,https://lemon-manuals.gy"
+)
+  .split(",")
+  .map((s) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+const ALLOWED_ORIGINS = BASES.map((b) => new URL(b).origin);
+const PRIMARY = BASES[0];
+
+// Non-content pages to skip when extracting links.
+const SKIP_PATHS = new Set([
+  "",
+  "nfo.html",
+  "about.html",
+  "bittorrent.html",
+  "index.html",
+  "lemon-manuals.torrent",
+]);
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ");
+}
+
+function pathSegments(path: string): string[] {
+  return path
+    .replace(/^\/+|\/+$/g, "")
+    .split("/")
+    .filter(Boolean)
+    .map((s) => decodeURIComponent(s));
+}
+
+function encodePath(path: string): string {
+  return pathSegments(path)
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+}
+
+async function fetchUrl(target: string): Promise<{ html: string; finalUrl: string }> {
+  const u = new URL(target);
+  if (!ALLOWED_ORIGINS.includes(u.origin)) {
+    throw new Error(`URL origin must be one of: ${ALLOWED_ORIGINS.join(", ")} — got ${u.origin}`);
   }
-  return response.text();
+  const ordered = [u.origin, ...ALLOWED_ORIGINS.filter((o) => o !== u.origin)];
+  let lastErr: unknown;
+  for (const origin of ordered) {
+    const candidate = origin + u.pathname + u.search;
+    try {
+      const res = await fetch(candidate, {
+        headers: { "User-Agent": UA, Accept: "text/html" },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${candidate}`);
+      return { html: await res.text(), finalUrl: candidate };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`All mirrors failed for ${u.pathname}: ${String(lastErr)}`);
+}
+
+async function fetchDir(path: string): Promise<{ html: string; finalUrl: string }> {
+  const encoded = encodePath(path);
+  const target = encoded.length ? `${PRIMARY}/${encoded}/` : `${PRIMARY}/`;
+  return fetchUrl(target);
 }
 
 interface LinkEntry {
   text: string;
   url: string;
+  pathname: string;
+  segments: string[];
 }
 
-/**
- * Extract markdown links from content, filtering for charm.li URLs only.
- * Skips navigation links (Home, About) and javascript: links.
- */
-function extractCharmLinks(markdown: string, pathPrefix?: string): LinkEntry[] {
-  const linkPattern = /\[([^\]]+)\]\((https?:\/\/charm\.li\/[^)]+)\)/g;
+function extractLinks(html: string, baseUrl: string): LinkEntry[] {
+  const re = /<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   const seen = new Set<string>();
-  const results: LinkEntry[] = [];
-
-  let match: RegExpExecArray | null;
-  while ((match = linkPattern.exec(markdown)) !== null) {
-    const text = match[1].trim();
-    const url = match[2].trim();
-
-    // Skip navigation/breadcrumb links
-    if (text === "Home" || text === "About Operation CHARM") continue;
-    // Skip if we have a prefix filter and URL doesn't match
-    if (pathPrefix && !url.startsWith(pathPrefix)) continue;
-    // Skip duplicates
-    if (seen.has(url)) continue;
-
-    seen.add(url);
-    results.push({ text, url });
-  }
-
-  return results;
-}
-
-/**
- * Validate that a URL starts with https://charm.li/ for safety.
- */
-function validateCharmUrl(url: string): void {
-  if (!url.startsWith(`${BASE_URL}/`)) {
-    throw new Error(
-      `URL must start with ${BASE_URL}/ — got: ${url}`
-    );
-  }
-}
-
-/**
- * Build a charm.li URL from a path, ensuring proper encoding.
- */
-function charmUrl(path: string): string {
-  // Normalize: remove leading slash, ensure no double slashes
-  const normalized = path.replace(/^\/+/, "").replace(/\/+$/, "");
-  return `${BASE_URL}/${normalized}/`;
-}
-
-const server = new McpServer({
-  name: "mcp-charm",
-  version: "0.1.0",
-});
-
-// Tool 1: list_makes
-server.registerTool(
-  "list_makes",
-  {
-    description:
-      "List all car makes available on charm.li (Operation CHARM free service manuals). Returns an array of make names like Acura, BMW, Ford, Toyota, etc.",
-    inputSchema: {},
-  },
-  async () => {
-    const markdown = await fetchMarkdown(BASE_URL + "/");
-    const links = extractCharmLinks(markdown, `${BASE_URL}/`);
-
-    // Top-level makes are direct children: charm.li/Make/ (no further slashes in path)
-    const makes = links
-      .filter((link) => {
-        const path = link.url.replace(`${BASE_URL}/`, "").replace(/\/$/, "");
-        return path.length > 0 && !path.includes("/");
-      })
-      .map((link) => ({
-        name: link.text,
-        url: link.url,
-      }));
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              makes: makes.map((m) => m.name),
-              count: makes.length,
-              details: makes,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
-);
-
-// Tool 2: browse_make
-server.registerTool(
-  "browse_make",
-  {
-    description:
-      "Browse available years for a given car make on charm.li. For example, browse_make('Ford') returns all years (1982–2013) for which Ford manuals exist. Use browse_manuals with a year path to see models for that year.",
-    inputSchema: {
-      make: z
-        .string()
-        .min(1)
-        .describe(
-          'Car make name, e.g. "Ford", "BMW", "Toyota". Use list_makes to see all available makes.'
-        ),
-    },
-  },
-  async ({ make }) => {
-    const url = charmUrl(make);
-    const markdown = await fetchMarkdown(url);
-    const prefix = `${BASE_URL}/${encodeURIComponent(make)}/`;
-    const links = extractCharmLinks(markdown, `${BASE_URL}/`);
-
-    // Filter to direct children of this make
-    const entries = links
-      .filter((link) => {
-        const withoutBase = link.url.replace(`${BASE_URL}/`, "");
-        const parts = withoutBase.replace(/\/$/, "").split("/");
-        return parts.length === 2; // make/year
-      })
-      .map((link) => ({
-        label: link.text,
-        url: link.url,
-        path: link.url.replace(`${BASE_URL}/`, "").replace(/\/$/, ""),
-      }));
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              make,
-              url,
-              entries,
-              count: entries.length,
-              note: `Use browse_manuals with path like "${make}/2010" to see models for a specific year.`,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
-);
-
-// Tool 3: browse_manuals
-server.registerTool(
-  "browse_manuals",
-  {
-    description:
-      'Browse manuals at a specific path on charm.li. Use paths like "Ford/2010" to see model+engine combos, or "Ford/2010/Crown Victoria V8-4.6L" to see manual sections (Repair and Diagnosis, Parts and Labor).',
-    inputSchema: {
-      path: z
-        .string()
-        .min(1)
-        .describe(
-          'Path within charm.li, e.g. "Ford/2010", "Toyota/2005", "Ford/2010/Crown Victoria V8-4.6L". Do not include leading or trailing slashes.'
-        ),
-    },
-  },
-  async ({ path }) => {
-    const url = charmUrl(path);
-    const markdown = await fetchMarkdown(url);
-
-    // Extract all charm.li links that are children of this path
-    const links = extractCharmLinks(markdown, `${BASE_URL}/`);
-
-    const entries = links
-      .filter((link) => {
-        // Must be a child of current path
-        const normalized = url.replace(/\/$/, "");
-        return (
-          link.url.startsWith(normalized + "/") && link.url !== normalized + "/"
-        );
-      })
-      .map((link) => {
-        const relativePath = link.url
-          .replace(url, "")
-          .replace(/\/$/, "");
-        const isDirectory = link.url.endsWith("/");
-        return {
-          name: link.text,
-          url: link.url,
-          path: path + "/" + relativePath,
-          type: isDirectory ? "directory" : "file",
-        };
-      });
-
-    // Also look for non-charm.li links that are downloadable files
-    const filePattern = /\[([^\]]+)\]\((https?:\/\/charm\.li\/bundle\/[^)]+)\)/g;
-    const bundles: Array<{ name: string; url: string; type: string }> = [];
-    let match: RegExpExecArray | null;
-    while ((match = filePattern.exec(markdown)) !== null) {
-      bundles.push({
-        name: match[1].trim(),
-        url: match[2].trim(),
-        type: "download",
-      });
+  const out: LinkEntry[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const rawHref = decodeEntities(m[1].trim());
+    const text = decodeEntities(m[2].replace(/<[^>]+>/g, "").trim());
+    if (!text || rawHref.startsWith("javascript:") || rawHref.startsWith("#")) continue;
+    let u: URL;
+    try {
+      u = new URL(rawHref, baseUrl);
+    } catch {
+      continue;
     }
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              path,
-              url,
-              entries: [...entries, ...bundles],
-              count: entries.length + bundles.length,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
-);
-
-// Tool 4: search_manuals
-server.registerTool(
-  "search_manuals",
-  {
-    description:
-      "Search for service manuals by car make and optional keyword. If the query includes a 4-digit year (e.g. '2010'), only that year is searched. Otherwise, the most recent available years are searched. Returns matching model/manual entries with URLs.",
-    inputSchema: {
-      make: z
-        .string()
-        .min(1)
-        .describe(
-          'Car make to search within, e.g. "Ford", "Toyota". Use list_makes to see all available makes.'
-        ),
-      query: z
-        .string()
-        .optional()
-        .describe(
-          'Optional search keyword. Can be a year (e.g. "2010"), model name (e.g. "F-150"), engine (e.g. "V8"), or combination (e.g. "2010 F-150").'
-        ),
-    },
-  },
-  async ({ make, query }) => {
-    // Step 1: Fetch make page to get available years
-    const makeUrl = charmUrl(make);
-    const makeMarkdown = await fetchMarkdown(makeUrl);
-    const allLinks = extractCharmLinks(makeMarkdown, `${BASE_URL}/`);
-
-    // Get year entries (2-level paths: make/year)
-    const yearEntries = allLinks.filter((link) => {
-      const withoutBase = link.url.replace(`${BASE_URL}/`, "");
-      const parts = withoutBase.replace(/\/$/, "").split("/");
-      return parts.length === 2;
+    if (!ALLOWED_ORIGINS.includes(u.origin)) continue;
+    const pathname = u.pathname.replace(/\/+$/, "");
+    const tail = pathname.replace(/^\/+/, "");
+    if (SKIP_PATHS.has(tail.toLowerCase())) continue;
+    const key = pathname; // dedupe across mirrors by path
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      text,
+      url: u.toString(),
+      pathname,
+      segments: pathSegments(pathname),
     });
+  }
+  return out;
+}
 
-    if (yearEntries.length === 0) {
+function htmlToMarkdown(html: string, baseUrl: string): string {
+  let s = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "");
+  s = s.replace(/<img[^>]*src="([^"]+)"[^>]*>/gi, (_m, src) => {
+    try {
+      return `![image](${new URL(decodeEntities(String(src)), baseUrl).toString()})`;
+    } catch {
+      return "";
+    }
+  });
+  s = s.replace(/<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
+    const t = decodeEntities(String(text).replace(/<[^>]+>/g, "").trim());
+    try {
+      const u = new URL(decodeEntities(String(href)), baseUrl);
+      if (u.protocol === "javascript:") return t;
+      return `[${t}](${u.toString()})`;
+    } catch {
+      return t;
+    }
+  });
+  s = s
+    .replace(/<h([1-6])[^>]*>/gi, (_m, n) => `\n\n${"#".repeat(Number(n))} `)
+    .replace(/<\/h[1-6]>/gi, "\n");
+  s = s.replace(/<li[^>]*>/gi, "\n- ").replace(/<\/li>/gi, "");
+  s = s.replace(/<br\s*\/?\s*>/gi, "\n");
+  s = s.replace(/<t[dh][^>]*>/gi, " | ");
+  s = s.replace(/<\/(p|div|ul|ol|table|tr)>/gi, "\n");
+  s = s.replace(/<[^>]+>/g, "");
+  s = decodeEntities(s);
+  return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function buildServer(): McpServer {
+  const server = new McpServer({
+    name: "lemon-mcp",
+    version: VERSION,
+  });
+
+  // Tool 1: list_makes
+  server.registerTool(
+    "list_makes",
+    {
+      description:
+        "List all vehicle makes available on LEMON Manuals (free service/workshop manuals, model years 1960-2025, US & Canada market, includes classic Operation CHARM data). Returns make names like Acura, BMW, Ford, Tesla, Toyota.",
+      inputSchema: {},
+    },
+    async () => {
+      const { html, finalUrl } = await fetchDir("");
+      const links = extractLinks(html, finalUrl);
+      const makes = links
+        .filter((l) => l.segments.length === 1)
+        .map((l) => ({ name: l.text, url: l.url }));
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(
-              { make, query, results: [], note: "No years found for this make." },
+              { makes: makes.map((m) => m.name), count: makes.length, details: makes },
               null,
               2
             ),
@@ -301,10 +189,173 @@ server.registerTool(
         ],
       };
     }
+  );
 
-    // Step 2: Determine which years to fetch
-    let yearsToSearch: typeof yearEntries;
-    if (query) {
+  // Tool 2: browse_make
+  server.registerTool(
+    "browse_make",
+    {
+      description:
+        "Browse available model years for a given make on LEMON Manuals. For example, browse_make('Ford') returns all years (1960-2025) for which Ford manuals exist. Use browse_manuals with a 'Make/Year' path to see models for that year.",
+      inputSchema: {
+        make: z
+          .string()
+          .min(1)
+          .describe('Vehicle make name, e.g. "Ford", "BMW", "Toyota". Use list_makes to see all available makes.'),
+      },
+    },
+    async ({ make }) => {
+      const { html, finalUrl } = await fetchDir(make);
+      const links = extractLinks(html, finalUrl);
+      const makeLower = make.trim().toLowerCase();
+      const entries = links
+        .filter(
+          (l) =>
+            l.segments.length === 2 &&
+            l.segments[0].toLowerCase() === makeLower
+        )
+        .map((l) => ({
+          label: l.text,
+          url: l.url,
+          path: l.segments.join("/"),
+        }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                make,
+                url: finalUrl,
+                entries,
+                count: entries.length,
+                note: `Use browse_manuals with path like "${make}/2018" to see models for a specific year.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // Tool 3: browse_manuals
+  server.registerTool(
+    "browse_manuals",
+    {
+      description:
+        'Browse manuals at a specific path on LEMON Manuals. Use paths like "Ford/2018" to see model+engine combos, or "Ford/2018/F 150 4WD V8-5.0L" to see manual sections (Repair and Diagnosis, Parts and Labor, TSBs, zip download).',
+      inputSchema: {
+        path: z
+          .string()
+          .min(1)
+          .describe('Path within the site, e.g. "Ford/2018", "Toyota/2005", "Ford/2018/F 150 4WD V8-5.0L". No leading/trailing slashes.'),
+      },
+    },
+    async ({ path }) => {
+      const { html, finalUrl } = await fetchDir(path);
+      const links = extractLinks(html, finalUrl);
+      const parentSegs = pathSegments(path);
+      const isChild = (l: LinkEntry) =>
+        l.segments.length === parentSegs.length + 1 &&
+        parentSegs.every((seg, i) => l.segments[i].toLowerCase() === seg.toLowerCase());
+      const entries = links
+        .filter((l) => isChild(l) && !/\.zip$/i.test(l.pathname))
+        .map((l) => ({
+          name: l.text,
+          url: l.url,
+          path: l.segments.join("/"),
+          type: "directory",
+        }));
+      const downloads = links
+        .filter((l) => /\.zip$/i.test(l.pathname))
+        .map((l) => ({ name: l.text, url: l.url, type: "download" }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                path,
+                url: finalUrl,
+                entries: [...entries, ...downloads],
+                count: entries.length + downloads.length,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // Tool 4: search_manuals
+  server.registerTool(
+    "search_manuals",
+    {
+      description:
+        "Search for service manuals by vehicle make and optional keyword. If the query includes a 4-digit year (e.g. '2018'), only that year is searched. Otherwise the 5 most recent available years are searched. Returns matching model/manual entries with URLs.",
+      inputSchema: {
+        make: z
+          .string()
+          .min(1)
+          .describe('Vehicle make to search within, e.g. "Ford", "Toyota". Use list_makes to see all available makes.'),
+        query: z
+          .string()
+          .optional()
+          .describe('Optional search keyword. Can be a year ("2018"), model ("F-150"), engine ("V8"), or combo ("2018 F-150").'),
+      },
+    },
+    async ({ make, query }) => {
+      const { html, finalUrl } = await fetchDir(make);
+      const makeLower = make.trim().toLowerCase();
+      const yearEntries = extractLinks(html, finalUrl).filter(
+        (l) => l.segments.length === 2 && l.segments[0].toLowerCase() === makeLower
+      );
+
+      if (yearEntries.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { make, query, results: [], note: "No years found for this make." },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      if (!query) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  make,
+                  query: null,
+                  results: yearEntries.map((e) => ({
+                    label: e.text,
+                    url: e.url,
+                    path: e.segments.join("/"),
+                  })),
+                  count: yearEntries.length,
+                  note: `Showing available years for ${make}. Provide a query with a year or model name to search for specific manuals.`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      let yearsToSearch: typeof yearEntries;
       const yearMatch = query.match(/\b(19|20)\d{2}\b/);
       if (yearMatch) {
         const targetYear = yearMatch[0];
@@ -329,11 +380,46 @@ server.registerTool(
           };
         }
       } else {
-        // No year in query — search most recent 5 years
         yearsToSearch = yearEntries.slice(-5);
       }
-    } else {
-      // No query — return the year listing
+
+      const keyword = query.replace(/\b(19|20)\d{2}\b/, "").trim().toLowerCase();
+      const results: Array<{ make: string; year: string; model: string; url: string; path: string }> = [];
+
+      await Promise.all(
+        yearsToSearch.map(async (yearEntry) => {
+          try {
+            const dir = yearEntry.segments.join("/");
+            const { html: yh, finalUrl: yu } = await fetchDir(dir);
+            const modelEntries = extractLinks(yh, yu).filter(
+              (l) =>
+                l.segments.length === 3 &&
+                l.segments[0].toLowerCase() === makeLower &&
+                l.segments[1] === yearEntry.text
+            );
+            for (const entry of modelEntries) {
+              if (!keyword || entry.text.toLowerCase().includes(keyword)) {
+                results.push({
+                  make,
+                  year: yearEntry.text,
+                  model: entry.text,
+                  url: entry.url,
+                  path: entry.segments.join("/"),
+                });
+              }
+            }
+          } catch {
+            // skip years that fail
+          }
+        })
+      );
+
+      results.sort((a, b) => {
+        const yearDiff = parseInt(b.year) - parseInt(a.year);
+        if (yearDiff !== 0) return yearDiff;
+        return a.model.localeCompare(b.model);
+      });
+
       return {
         content: [
           {
@@ -341,14 +427,10 @@ server.registerTool(
             text: JSON.stringify(
               {
                 make,
-                query: null,
-                results: yearEntries.map((e) => ({
-                  label: e.text,
-                  url: e.url,
-                  path: e.url.replace(`${BASE_URL}/`, "").replace(/\/$/, ""),
-                })),
-                count: yearEntries.length,
-                note: `Showing available years for ${make}. Provide a query with a year or model name to search for specific manuals.`,
+                query,
+                results,
+                count: results.length,
+                note: results.length === 0 ? `No manuals found matching "${query}" for ${make}.` : undefined,
               },
               null,
               2
@@ -357,112 +439,86 @@ server.registerTool(
         ],
       };
     }
+  );
 
-    // Step 3: Fetch year pages and filter by query keyword
-    const keyword = query
-      .replace(/\b(19|20)\d{2}\b/, "")
-      .trim()
-      .toLowerCase();
-
-    const results: Array<{ make: string; year: string; model: string; url: string; path: string }> = [];
-
-    await Promise.all(
-      yearsToSearch.map(async (yearEntry) => {
-        const year = yearEntry.text;
-        try {
-          const yearMarkdown = await fetchMarkdown(yearEntry.url);
-          const modelLinks = extractCharmLinks(yearMarkdown, `${BASE_URL}/`);
-
-          // 3-level paths: make/year/model
-          const modelEntries = modelLinks.filter((link) => {
-            const withoutBase = link.url.replace(`${BASE_URL}/`, "");
-            const parts = withoutBase.replace(/\/$/, "").split("/");
-            return parts.length === 3;
-          });
-
-          for (const entry of modelEntries) {
-            if (!keyword || entry.text.toLowerCase().includes(keyword)) {
-              results.push({
-                make,
-                year,
-                model: entry.text,
-                url: entry.url,
-                path: entry.url.replace(`${BASE_URL}/`, "").replace(/\/$/, ""),
-              });
-            }
-          }
-        } catch {
-          // Skip years that fail to fetch
-        }
-      })
-    );
-
-    // Sort by year descending, then model name
-    results.sort((a, b) => {
-      const yearDiff = parseInt(b.year) - parseInt(a.year);
-      if (yearDiff !== 0) return yearDiff;
-      return a.model.localeCompare(b.model);
-    });
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              make,
-              query,
-              results,
-              count: results.length,
-              note:
-                results.length === 0
-                  ? `No manuals found matching "${query}" for ${make}.`
-                  : undefined,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
-);
-
-// Tool 5: get_manual_content
-server.registerTool(
-  "get_manual_content",
-  {
-    description:
-      "Fetch the content of a specific charm.li page — returns the page as markdown including links to manual sections and PDF files. The URL must start with https://charm.li/.",
-    inputSchema: {
-      url: z
-        .string()
-        .url()
-        .describe(
-          "Full URL of a charm.li page, e.g. https://charm.li/Ford/2010/Crown%20Victoria%20V8-4.6L/. Must start with https://charm.li/."
-        ),
+  // Tool 5: get_manual_content
+  server.registerTool(
+    "get_manual_content",
+    {
+      description:
+        "Fetch the content of a specific LEMON Manuals page as markdown, including procedure text, image links, and links to manual sections and zip downloads. URL must be on a lemon-manuals domain.",
+      inputSchema: {
+        url: z
+          .string()
+          .url()
+          .describe("Full URL of a LEMON Manuals page, e.g. https://lemon-manuals.la/Ford/2018/F%20150%204WD%20V8-5.0L/. Must be on an allowed lemon-manuals domain."),
+      },
     },
-  },
-  async ({ url }) => {
-    validateCharmUrl(url);
-    const markdown = await fetchMarkdown(url);
-    return {
-      content: [
-        {
-          type: "text",
-          text: markdown,
-        },
-      ],
-    };
-  }
-);
+    async ({ url }) => {
+      const { html, finalUrl } = await fetchUrl(url);
+      return {
+        content: [
+          {
+            type: "text",
+            text: htmlToMarkdown(html, finalUrl),
+          },
+        ],
+      };
+    }
+  );
 
-async function main() {
+  return server;
+}
+
+async function runStdio() {
+  const server = buildServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((err) => {
+async function runHttp() {
+  const app = express();
+  app.use(express.json({ limit: "4mb" }));
+  const token = process.env.MCP_AUTH_TOKEN;
+
+  app.get("/health", (_req, res) => {
+    res.json({ ok: true, service: "lemon-mcp", version: VERSION, mirrors: BASES });
+  });
+
+  app.all("/mcp", async (req, res) => {
+    if (token) {
+      const auth = req.headers.authorization ?? "";
+      if (auth !== `Bearer ${token}`) {
+        res.status(401).json({ error: "unauthorized" });
+        return;
+      }
+    }
+    try {
+      const server = buildServer();
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => {
+        transport.close();
+        server.close();
+      });
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      console.error("MCP request error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: String(err) });
+      }
+    }
+  });
+
+  const port = Number(process.env.PORT ?? 8080);
+  app.listen(port, "0.0.0.0", () => {
+    console.error(`lemon-mcp ${VERSION} HTTP listening on :${port} (mirrors: ${BASES.join(", ")})`);
+  });
+}
+
+const mode = process.argv[2] ?? process.env.MCP_TRANSPORT ?? "stdio";
+const entry = mode === "http" ? runHttp() : runStdio();
+entry.catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
 });
