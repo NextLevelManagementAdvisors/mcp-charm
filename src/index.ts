@@ -527,6 +527,296 @@ function createServer(): McpServer {
   );
 
   server.registerTool(
+    "search_diagnosis",
+    {
+      description:
+        "Search a vehicle's Repair & Diagnosis manual sections by symptom text. Crawls the Repair & Diagnosis subtree, ranks sections by keyword match density, and returns the top 3–5 matches with paths and snippets. Use this when you don't know which section covers a specific customer complaint (e.g. 'rear AC blows hot', 'knocking when cold').",
+      inputSchema: {
+        make: z
+          .string()
+          .min(1)
+          .describe('Car make, e.g. "Ford", "Toyota". Use list_makes to see all available makes.'),
+        year: z
+          .string()
+          .length(4)
+          .describe('4-digit model year, e.g. "2011".'),
+        model: z
+          .string()
+          .min(1)
+          .describe('Model name (partial match supported), e.g. "E450", "F-150", "Crown Victoria".'),
+        symptom_text: z
+          .string()
+          .min(1)
+          .describe('Symptom in plain language, e.g. "rear AC blows hot", "heater only works on high fan speed", "knocking noise under hood when cold".'),
+      },
+    },
+    async ({ make, year, model, symptom_text }) => {
+      // Tokenize symptom — drop short stop-words
+      const symptomTokens = symptom_text
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((t) => t.length > 2);
+
+      if (symptomTokens.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { error: "symptom_text produced no searchable tokens after filtering." },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      function scoreText(text: string): number {
+        const lower = text.toLowerCase();
+        let score = 0;
+        for (const token of symptomTokens) {
+          const re = new RegExp(token, "g");
+          const hits = lower.match(re);
+          if (hits) score += hits.length;
+        }
+        return score;
+      }
+
+      function extractSnippet(markdown: string, maxLen = 220): string {
+        // Strip markdown link syntax and leading junk for readability
+        const cleaned = markdown
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+          .replace(/[#*_`>]/g, "")
+          .replace(/\n{2,}/g, "\n")
+          .trim();
+
+        const lower = cleaned.toLowerCase();
+        let bestIdx = -1;
+        for (const token of symptomTokens) {
+          const idx = lower.indexOf(token);
+          if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) bestIdx = idx;
+        }
+
+        const start = bestIdx === -1 ? 0 : Math.max(0, bestIdx - 60);
+        const raw = cleaned.slice(start, start + maxLen).trim();
+        return (start > 0 ? "…" : "") + raw + (raw.length >= maxLen ? "…" : "");
+      }
+
+      // Step 1: find exact model URL via make/year page
+      const yearUrl = charmUrl(`${make}/${year}`);
+      let yearMarkdown: string;
+      try {
+        yearMarkdown = await fetchMarkdown(yearUrl);
+      } catch {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { make, year, model, symptom_text, results: [], note: `Could not fetch ${yearUrl}` },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const allModelLinks = extractCharmLinks(yearMarkdown, `${BASE_URL}/`);
+      const modelKeyword = model.toLowerCase();
+      const matchingModel = allModelLinks.find((link) => {
+        const parts = link.url.replace(`${BASE_URL}/`, "").replace(/\/$/, "").split("/");
+        return parts.length === 3 && link.text.toLowerCase().includes(modelKeyword);
+      });
+
+      if (!matchingModel) {
+        const available = allModelLinks
+          .filter((l) => {
+            const p = l.url.replace(`${BASE_URL}/`, "").replace(/\/$/, "").split("/");
+            return p.length === 3;
+          })
+          .map((l) => l.text);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  make,
+                  year,
+                  model,
+                  symptom_text,
+                  results: [],
+                  note: `No model matching "${model}" found for ${make} ${year}. Available: ${available.join(", ")}`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Step 2: find Repair & Diagnosis link on the model page
+      const modelMarkdown = await fetchMarkdown(matchingModel.url);
+      const modelPageLinks = extractCharmLinks(modelMarkdown, matchingModel.url);
+      const rdLink = modelPageLinks.find(
+        (l) =>
+          l.text.toLowerCase().includes("repair") &&
+          l.text.toLowerCase().includes("diagnos")
+      );
+
+      if (!rdLink) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  make,
+                  year,
+                  model: matchingModel.text,
+                  symptom_text,
+                  results: [],
+                  note: `No "Repair & Diagnosis" section found for ${matchingModel.text}.`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Step 3: crawl 2 levels of the R&D subtree
+      const rdMarkdown = await fetchMarkdown(rdLink.url);
+      const level1Links = extractCharmLinks(rdMarkdown, rdLink.url).filter(
+        (l) => l.url !== rdLink.url
+      );
+
+      interface Candidate {
+        url: string;
+        path: string;
+        title: string;
+        system: string;
+        titleScore: number;
+      }
+
+      const candidates: Candidate[] = [];
+
+      // Add level-1 sections as candidates
+      for (const l1 of level1Links) {
+        candidates.push({
+          url: l1.url,
+          path: l1.url.replace(`${BASE_URL}/`, "").replace(/\/$/, ""),
+          title: l1.text,
+          system: l1.text,
+          titleScore: scoreText(l1.text) * 3,
+        });
+      }
+
+      // Fetch level-2 sections in parallel
+      await Promise.all(
+        level1Links.map(async (l1) => {
+          try {
+            const l1Markdown = await fetchMarkdown(l1.url);
+            const l2Links = extractCharmLinks(l1Markdown, l1.url).filter(
+              (l) => l.url !== l1.url
+            );
+            for (const l2 of l2Links) {
+              candidates.push({
+                url: l2.url,
+                path: l2.url.replace(`${BASE_URL}/`, "").replace(/\/$/, ""),
+                title: l2.text,
+                system: l1.text,
+                titleScore: scoreText(l2.text) * 3 + scoreText(l1.text),
+              });
+            }
+          } catch {
+            // skip unreachable sections
+          }
+        })
+      );
+
+      // Step 4: score candidates — fetch content for top candidates by title score
+      const topByTitle = candidates
+        .slice()
+        .sort((a, b) => b.titleScore - a.titleScore)
+        .slice(0, 12);
+
+      interface ScoredResult {
+        section_title: string;
+        system: string;
+        relevance_score: number;
+        path: string;
+        snippet: string;
+      }
+
+      const scored: ScoredResult[] = (
+        await Promise.all(
+          topByTitle.map(async (c) => {
+            try {
+              const content = await fetchMarkdown(c.url);
+              const contentHits = scoreText(content);
+              const wordCount = Math.max(1, content.split(/\s+/).length);
+              const density = contentHits / wordCount;
+
+              // Composite: title match (weight 0.5) + raw content hits (0.3) + density (0.2)
+              const raw =
+                (c.titleScore / (symptomTokens.length * 3)) * 0.5 +
+                Math.min(1, contentHits / (symptomTokens.length * 5)) * 0.3 +
+                Math.min(1, density * 500) * 0.2;
+
+              const relevance_score = Math.round(Math.min(1, raw) * 100) / 100;
+
+              if (relevance_score === 0 && contentHits === 0 && c.titleScore === 0) return null;
+
+              return {
+                section_title: c.title,
+                system: c.system,
+                relevance_score,
+                path: c.path,
+                snippet: extractSnippet(content),
+              } satisfies ScoredResult;
+            } catch {
+              return null;
+            }
+          })
+        )
+      )
+        .filter((r): r is ScoredResult => r !== null && r.relevance_score > 0)
+        .sort((a, b) => b.relevance_score - a.relevance_score)
+        .slice(0, 5);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                make,
+                year,
+                model: matchingModel.text,
+                symptom_text,
+                results: scored,
+                count: scored.length,
+                note:
+                  scored.length === 0
+                    ? "No matching sections found. Try broader symptom terms or use browse_manuals to explore the Repair & Diagnosis tree manually."
+                    : undefined,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
     "get_manual_content",
     {
       description:
