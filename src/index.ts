@@ -28,6 +28,122 @@ interface LinkEntry {
   url: string;
 }
 
+interface DtcResult {
+  dtc: string;
+  description: string;
+  system: string;
+  module: string;
+  pinpoint_test_label: string;
+  pinpoint_test_url: string;
+}
+
+function stripMarkdownLinks(text: string): string {
+  return text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();
+}
+
+function safeDecodeUri(url: string): string {
+  try {
+    return decodeURIComponent(url);
+  } catch {
+    return url;
+  }
+}
+
+function isUrlDirectChild(childUrl: string, parentUrl: string): boolean {
+  const parent = safeDecodeUri(parentUrl.replace(/\/$/, "") + "/");
+  const child = safeDecodeUri(childUrl);
+  if (!child.startsWith(parent) || child === parent) return false;
+  const subPath = child.replace(parent, "").replace(/\/$/, "");
+  return !subPath.includes("/");
+}
+
+function parseDtcTable(
+  markdown: string,
+  targetDtc: string
+): {
+  description: string;
+  system_from_table: string;
+  pinpoint_test_label: string;
+  pinpoint_test_url: string;
+} | null {
+  const lines = markdown.split("\n");
+  let state: "none" | "header" | "data" = "none";
+  let headers: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed.startsWith("|")) {
+      state = "none";
+      headers = [];
+      continue;
+    }
+
+    const cells = trimmed.split("|").slice(1, -1).map((c) => c.trim());
+
+    if (cells.every((c) => /^[-: ]+$/.test(c))) {
+      if (state === "header") state = "data";
+      continue;
+    }
+
+    if (state !== "data") {
+      headers = cells.map((c) => stripMarkdownLinks(c).trim().toLowerCase());
+      state = "header";
+      continue;
+    }
+
+    const dtcCell = stripMarkdownLinks(cells[0] ?? "").toUpperCase().trim();
+    if (dtcCell !== targetDtc) continue;
+
+    const indexOf = (needles: string[]): number => {
+      for (const needle of needles) {
+        const idx = headers.findIndex((h) => h.includes(needle));
+        if (idx >= 0) return idx;
+      }
+      return -1;
+    };
+
+    const descIdx = indexOf(["description", "condition"]);
+    const sysIdx = indexOf(["system", "subsystem"]);
+    const ptIdx = indexOf(["pinpoint"]);
+
+    const description =
+      descIdx >= 0 && descIdx < cells.length
+        ? stripMarkdownLinks(cells[descIdx] ?? "")
+        : cells.length > 1
+          ? stripMarkdownLinks(cells[1] ?? "")
+          : "";
+
+    const systemFromTable =
+      sysIdx >= 0 && sysIdx < cells.length
+        ? stripMarkdownLinks(cells[sysIdx] ?? "")
+        : "";
+
+    const pinpointCellIdx = ptIdx >= 0 ? ptIdx : cells.length - 1;
+    const pinpointCell =
+      pinpointCellIdx < cells.length ? (cells[pinpointCellIdx] ?? "") : "";
+
+    const linkMatch = pinpointCell.match(
+      /\[([^\]]+)\]\((https?:\/\/charm\.li\/[^)]+)\)/
+    );
+
+    return {
+      description,
+      system_from_table: systemFromTable,
+      pinpoint_test_label: linkMatch
+        ? linkMatch[1].trim()
+        : stripMarkdownLinks(pinpointCell),
+      pinpoint_test_url: linkMatch
+        ? safeDecodeUri(
+            linkMatch[2].replace(`${BASE_URL}/`, "").replace(/\/$/, "")
+          )
+        : "",
+    };
+  }
+
+  return null;
+}
+
 function extractCharmLinks(markdown: string, pathPrefix?: string): LinkEntry[] {
   const linkPattern = /\[([^\]]+)\]\((https?:\/\/charm\.li\/[^)]+)\)/g;
   const seen = new Set<string>();
@@ -432,6 +548,220 @@ function createServer(): McpServer {
           {
             type: "text",
             text: markdown,
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "lookup_dtc",
+    {
+      description:
+        "Look up a Diagnostic Trouble Code (DTC) for a specific vehicle and return its description, system, module, and a direct URL to the pinpoint test — all in one call. Reduces DTC lookup from 4+ tool calls to 1. The returned pinpoint_test_url is a charm.li path that can be passed to browse_manuals() or prefixed with https://charm.li/ for get_manual_content().",
+      inputSchema: {
+        make: z
+          .string()
+          .min(1)
+          .describe(
+            'Car make, e.g. "Ford", "Toyota". Use list_makes() to see valid values.'
+          ),
+        year: z
+          .string()
+          .length(4)
+          .describe('4-digit model year, e.g. "2011".'),
+        model: z
+          .string()
+          .min(1)
+          .describe(
+            'Exact model name as it appears on charm.li, e.g. "E-450 Stripped Chassis", "Crown Victoria V8-4.6L". Use search_manuals() to find the exact name.'
+          ),
+        dtc_code: z
+          .string()
+          .min(2)
+          .describe(
+            'DTC code to look up, e.g. "P0128", "B1234", "C0035". Case-insensitive.'
+          ),
+      },
+    },
+    async ({ make, year, model, dtc_code }) => {
+      const targetDtc = dtc_code.toUpperCase().trim();
+
+      const repairUrl = charmUrl(
+        `${make}/${year}/${model}/Repair & Diagnosis`
+      );
+
+      let repairMarkdown: string;
+      try {
+        repairMarkdown = await fetchMarkdown(repairUrl);
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `Could not fetch Repair & Diagnosis section for ${make} ${year} ${model}`,
+                  detail: String(err),
+                  url: repairUrl,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Find system-level directories (e.g. Powertrain, Body, Chassis)
+      const allRepairLinks = extractCharmLinks(repairMarkdown, `${BASE_URL}/`);
+      const systemLinks = allRepairLinks.filter((link) =>
+        isUrlDirectChild(link.url, repairUrl)
+      );
+
+      if (systemLinks.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `No diagnostic systems found for ${make} ${year} ${model}`,
+                  url: repairUrl,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // For each system, find module directories
+      const moduleEntries: Array<{
+        url: string;
+        system: string;
+        name: string;
+      }> = [];
+
+      await Promise.all(
+        systemLinks.map(async (sysLink) => {
+          try {
+            const sysMarkdown = await fetchMarkdown(sysLink.url);
+            const sysLinks = extractCharmLinks(sysMarkdown, `${BASE_URL}/`);
+            const modules = sysLinks.filter((link) =>
+              isUrlDirectChild(link.url, sysLink.url)
+            );
+            for (const mod of modules) {
+              moduleEntries.push({
+                url: mod.url,
+                system: sysLink.text,
+                name: mod.text,
+              });
+            }
+          } catch {
+            // Skip inaccessible systems
+          }
+        })
+      );
+
+      // For each module, find DTC Index pages
+      const dtcIndexEntries: Array<{
+        url: string;
+        system: string;
+        module: string;
+      }> = [];
+
+      await Promise.all(
+        moduleEntries.map(async (modEntry) => {
+          try {
+            const modMarkdown = await fetchMarkdown(modEntry.url);
+            const modLinks = extractCharmLinks(modMarkdown, `${BASE_URL}/`);
+            const dtcLinks = modLinks.filter(
+              (link) =>
+                isUrlDirectChild(link.url, modEntry.url) &&
+                link.text.toLowerCase().includes("dtc index")
+            );
+            for (const dtcLink of dtcLinks) {
+              dtcIndexEntries.push({
+                url: dtcLink.url,
+                system: modEntry.system,
+                module: modEntry.name,
+              });
+            }
+          } catch {
+            // Skip inaccessible modules
+          }
+        })
+      );
+
+      if (dtcIndexEntries.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `No DTC Index pages found for ${make} ${year} ${model}`,
+                  systems_checked: [
+                    ...new Set(moduleEntries.map((m) => m.system)),
+                  ],
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Search each DTC Index page in parallel
+      const searchResults = await Promise.all(
+        dtcIndexEntries.map(async (entry) => {
+          try {
+            const dtcMarkdown = await fetchMarkdown(entry.url);
+            const parsed = parseDtcTable(dtcMarkdown, targetDtc);
+            if (!parsed) return null;
+            const result: DtcResult = {
+              dtc: targetDtc,
+              description: parsed.description,
+              system: parsed.system_from_table || entry.system,
+              module: entry.module,
+              pinpoint_test_label: parsed.pinpoint_test_label,
+              pinpoint_test_url: parsed.pinpoint_test_url,
+            };
+            return result;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      const foundResult = searchResults.find((r) => r !== null) ?? null;
+
+      if (!foundResult) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `DTC ${targetDtc} not found in ${make} ${year} ${model} service manuals`,
+                  note: `Searched ${dtcIndexEntries.length} DTC Index page(s) across: ${[...new Set(dtcIndexEntries.map((e) => e.system))].join(", ")}`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(foundResult, null, 2),
           },
         ],
       };
