@@ -1,7 +1,7 @@
 services:
   lemon-mcp:
     build: .
-    image: lemon-mcp:0.3.0
+    image: lemon-mcp:0.4.0
     container_name: lemon-mcp
     restart: unless-stopped
     env_file: .env

@@ -12,6 +12,7 @@ ENV NODE_ENV=production
 COPY package.json ./
 RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist
+COPY skills ./skills
 EXPOSE 8080
 ENV MCP_TRANSPORT=http
 CMD ["node", "dist/index.js", "http"]
