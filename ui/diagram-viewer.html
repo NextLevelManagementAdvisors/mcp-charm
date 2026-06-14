@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Manual Diagram Viewer</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        font-family: var(--font-sans, system-ui, sans-serif);
+        color: var(--color-text-primary, #1a1a1a);
+        background: var(--color-background-primary, #fff);
+      }
+      .head { padding: 8px 12px; font-size: 13px; opacity: .7; }
+      .grid {
+        display: grid; gap: 10px; padding: 0 12px 16px;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      }
+      figure {
+        margin: 0; border: 1px solid var(--color-border, #e2e2e2);
+        border-radius: 8px; overflow: hidden;
+        background: var(--color-background-secondary, #fafafa);
+      }
+      figure img {
+        display: block; width: 100%; height: 150px;
+        object-fit: contain; background: #fff; cursor: zoom-in;
+      }
+      figcaption {
+        padding: 6px 8px; font-size: 12px; line-height: 1.3;
+        opacity: .85; word-break: break-word;
+      }
+      .empty { padding: 16px; opacity: .6; font-size: 13px; }
+      .lb {
+        position: fixed; inset: 0; background: rgba(0,0,0,.85);
+        display: flex; align-items: center; justify-content: center;
+        cursor: zoom-out; z-index: 9999;
+      }
+      .lb-inner {
+        max-width: 95vw; max-height: 95vh; display: flex;
+        flex-direction: column; align-items: center; gap: 8px;
+      }
+      .lb-inner img { max-width: 95vw; max-height: 85vh; object-fit: contain; background: #fff; }
+      .lb-cap { color: #fff; font-size: 13px; text-align: center; max-width: 80vw; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

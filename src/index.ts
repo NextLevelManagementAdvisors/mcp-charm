@@ -4,8 +4,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
+import { registerDiagramApp } from "./diagram-app.js";
 
-const VERSION = "0.2.2";
+const VERSION = "0.3.0";
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
@@ -167,6 +168,7 @@ function buildServer(): McpServer {
     version: VERSION,
   });
 
+  registerDiagramApp(server, { fetchUrl, imageOrigins: ALLOWED_ORIGINS, version: VERSION });
   // Tool 1: list_makes
   server.registerTool(
     "list_makes",

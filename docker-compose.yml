@@ -1,0 +1,17 @@
+services:
+  lemon-mcp:
+    build: .
+    image: lemon-mcp:0.3.0
+    container_name: lemon-mcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: http
+    ports:
+      - "127.0.0.1:3070:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
