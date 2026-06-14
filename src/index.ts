@@ -349,7 +349,7 @@ function createServer(): McpServer {
     "search_manuals",
     {
       description:
-        "Search for service manuals by car make and optional keyword. If the query includes a 4-digit year (e.g. '2010'), only that year is searched. Otherwise, the most recent available years are searched. Returns matching model/manual entries with URLs.",
+        "Search for service manuals by car make and optional keyword. When 'year' is provided, only that year is searched. When 'year' is omitted, all available years are searched by default. Set 'recent_only' to true to limit the search to the 5 most recent years instead. Returns matching model/manual entries with URLs.",
       inputSchema: {
         make: z
           .string()
@@ -357,15 +357,27 @@ function createServer(): McpServer {
           .describe(
             'Car make to search within, e.g. "Ford", "Toyota". Use list_makes to see all available makes.'
           ),
-        query: z
+        keyword: z
           .string()
           .optional()
           .describe(
-            'Optional search keyword. Can be a year (e.g. "2010"), model name (e.g. "F-150"), engine (e.g. "V8"), or combination (e.g. "2010 F-150").'
+            'Optional search keyword to filter models, e.g. "F-150", "V8", "Auxiliary Heater", "P0128". When omitted, returns the list of available years for the make.'
+          ),
+        year: z
+          .string()
+          .optional()
+          .describe(
+            'Optional 4-digit model year to scope the search, e.g. "2011". When provided, only that year is searched. When omitted, all available years are searched (unless recent_only is true).'
+          ),
+        recent_only: z
+          .boolean()
+          .optional()
+          .describe(
+            'When true, limit the search to the 5 most recent years for the make instead of searching all years. Defaults to false. Ignored when a specific year is provided.'
           ),
       },
     },
-    async ({ make, query }) => {
+    async ({ make, keyword, year, recent_only }) => {
       const makeUrl = charmUrl(make);
       const makeMarkdown = await fetchMarkdown(makeUrl);
       const allLinks = extractCharmLinks(makeMarkdown, `${BASE_URL}/`);
@@ -384,7 +396,8 @@ function createServer(): McpServer {
               text: JSON.stringify(
                 {
                   make,
-                  query,
+                  keyword,
+                  year,
                   results: [],
                   note: "No years found for this make.",
                 },
@@ -396,35 +409,7 @@ function createServer(): McpServer {
         };
       }
 
-      let yearsToSearch: typeof yearEntries;
-      if (query) {
-        const yearMatch = query.match(/\b(19|20)\d{2}\b/);
-        if (yearMatch) {
-          const targetYear = yearMatch[0];
-          yearsToSearch = yearEntries.filter((e) => e.text === targetYear);
-          if (yearsToSearch.length === 0) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify(
-                    {
-                      make,
-                      query,
-                      results: [],
-                      note: `Year ${targetYear} not found for ${make}. Available years: ${yearEntries.map((e) => e.text).join(", ")}`,
-                    },
-                    null,
-                    2
-                  ),
-                },
-              ],
-            };
-          }
-        } else {
-          yearsToSearch = yearEntries.slice(-5);
-        }
-      } else {
+      if (!keyword && !year) {
         return {
           content: [
             {
@@ -432,7 +417,8 @@ function createServer(): McpServer {
               text: JSON.stringify(
                 {
                   make,
-                  query: null,
+                  keyword: null,
+                  year: null,
                   results: yearEntries.map((e) => ({
                     label: e.text,
                     url: e.url,
@@ -441,7 +427,7 @@ function createServer(): McpServer {
                       .replace(/\/$/, ""),
                   })),
                   count: yearEntries.length,
-                  note: `Showing available years for ${make}. Provide a query with a year or model name to search for specific manuals.`,
+                  note: `Showing available years for ${make}. Provide a keyword or year to search for specific manuals.`,
                 },
                 null,
                 2
@@ -451,10 +437,36 @@ function createServer(): McpServer {
         };
       }
 
-      const keyword = query
-        .replace(/\b(19|20)\d{2}\b/, "")
-        .trim()
-        .toLowerCase();
+      let yearsToSearch: typeof yearEntries;
+      if (year) {
+        yearsToSearch = yearEntries.filter((e) => e.text === year);
+        if (yearsToSearch.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    make,
+                    keyword,
+                    year,
+                    results: [],
+                    note: `Year ${year} not found for ${make}. Available years: ${yearEntries.map((e) => e.text).join(", ")}`,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+      } else if (recent_only) {
+        yearsToSearch = yearEntries.slice(-5);
+      } else {
+        yearsToSearch = yearEntries;
+      }
+
+      const normalizedKeyword = (keyword ?? "").trim().toLowerCase();
 
       const results: Array<{
         make: string;
@@ -466,7 +478,7 @@ function createServer(): McpServer {
 
       await Promise.all(
         yearsToSearch.map(async (yearEntry) => {
-          const year = yearEntry.text;
+          const entryYear = yearEntry.text;
           try {
             const yearMarkdown = await fetchMarkdown(yearEntry.url);
             const modelLinks = extractCharmLinks(yearMarkdown, `${BASE_URL}/`);
@@ -478,10 +490,10 @@ function createServer(): McpServer {
             });
 
             for (const entry of modelEntries) {
-              if (!keyword || entry.text.toLowerCase().includes(keyword)) {
+              if (!normalizedKeyword || entry.text.toLowerCase().includes(normalizedKeyword)) {
                 results.push({
                   make,
-                  year,
+                  year: entryYear,
                   model: entry.text,
                   url: entry.url,
                   path: entry.url
@@ -502,6 +514,12 @@ function createServer(): McpServer {
         return a.model.localeCompare(b.model);
       });
 
+      const searchScopeNote = year
+        ? `year ${year}`
+        : recent_only
+          ? "the 5 most recent years"
+          : "all available years";
+
       return {
         content: [
           {
@@ -509,13 +527,15 @@ function createServer(): McpServer {
             text: JSON.stringify(
               {
                 make,
-                query,
+                keyword: keyword ?? null,
+                year: year ?? null,
+                recent_only: recent_only ?? false,
                 results,
                 count: results.length,
                 note:
                   results.length === 0
-                    ? `No manuals found matching "${query}" for ${make}.`
-                    : undefined,
+                    ? `No manuals found matching "${keyword ?? ""}" in ${searchScopeNote} for ${make}.`
+                    : `Searched ${searchScopeNote} for ${make}.`,
               },
               null,
               2
