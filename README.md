@@ -4,13 +4,29 @@ MCP server for **Operation CHARM** — free car service manuals from [charm.li](
 
 Browse and search thousands of free car service manuals covering makes from Acura to Volvo, model years 1982 through 2013.
 
-## Install
+## Hosted MCP Endpoint
+
+The canonical public endpoint for the hosted deployment is:
+
+```
+https://manuals.nlma.io/mcp
+```
+
+Authentication requires a Bearer token:
+
+```
+Authorization: Bearer <MCP_AUTH_TOKEN>
+```
+
+> **Note:** Use `manuals.nlma.io` (plural). The singular `manual.nlma.io` resolves to the same IP but has no TLS certificate and will fail at the TLS handshake.
+
+## Local Install (npx / stdio)
 
 ```bash
 npx -y @gonzih/mcp-charm
 ```
 
-## Claude Desktop Configuration
+### Claude Desktop Configuration (stdio)
 
 Add to your `claude_desktop_config.json`:
 
@@ -24,6 +40,53 @@ Add to your `claude_desktop_config.json`:
   }
 }
 ```
+
+### Claude Desktop Configuration (hosted HTTP endpoint)
+
+```json
+{
+  "mcpServers": {
+    "charm": {
+      "url": "https://manuals.nlma.io/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+## Self-Hosting with Docker Compose
+
+Copy the example env file and set a strong token:
+
+```bash
+cp .env.example .env
+# edit .env and set MCP_AUTH_TOKEN
+```
+
+Start the container:
+
+```bash
+docker compose up -d
+```
+
+The service listens on `127.0.0.1:3070` (host) → `0.0.0.0:8080` (container).
+Nginx or another reverse proxy should terminate TLS and forward to `127.0.0.1:3070`.
+
+Health check:
+
+```bash
+curl http://127.0.0.1:3070/health
+# {"status":"ok","service":"mcp-charm","version":"0.2.0"}
+```
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | — | Set to `8080` (or any port) to enable HTTP mode. Unset = stdio mode. |
+| `MCP_AUTH_TOKEN` | — | Required Bearer token for `/mcp`. Omit to disable auth (not recommended). |
 
 ## Tools
 
