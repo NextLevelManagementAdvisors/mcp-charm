@@ -8,6 +8,7 @@ import type { Request, Response, NextFunction } from "express";
 
 const BASE_URL = "https://charm.li";
 const JINA_PREFIX = "https://r.jina.ai/";
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg|bmp|tiff?)(\?.*)?$/i;
 
 async function fetchMarkdown(url: string): Promise<string> {
   const jinaUrl = `${JINA_PREFIX}${url}`;
@@ -47,6 +48,63 @@ function extractCharmLinks(markdown: string, pathPrefix?: string): LinkEntry[] {
   }
 
   return results;
+}
+
+async function resolveImageUrl(wrapperUrl: string): Promise<string> {
+  try {
+    const response = await fetch(wrapperUrl, {
+      headers: {
+        "User-Agent": "mcp-charm/0.2.0 (https://github.com/gonzih/mcp-charm)",
+        Accept: "text/html",
+      },
+      redirect: "follow",
+    });
+    if (!response.ok) return wrapperUrl;
+    const html = await response.text();
+    const imgMatch = html.match(
+      /<img[^>]+src=["']([^"']+\.(?:png|jpe?g|gif|webp|svg|bmp)[^"']*)["']/i
+    );
+    if (imgMatch) {
+      const src = imgMatch[1];
+      if (src.startsWith("http")) return src;
+      return new URL(src, wrapperUrl).href;
+    }
+  } catch {
+    // Return original on any error
+  }
+  return wrapperUrl;
+}
+
+async function resolveMarkdownImageUrls(markdown: string): Promise<string> {
+  const imagePattern = /!\[([^\]]*)\]\((https?:\/\/[^)]+)\)/g;
+  const candidates = new Map<string, string>();
+
+  let match: RegExpExecArray | null;
+  while ((match = imagePattern.exec(markdown)) !== null) {
+    const url = match[2].trim();
+    if (!IMAGE_EXT_RE.test(url)) {
+      candidates.set(url, url);
+    }
+  }
+
+  if (candidates.size === 0) return markdown;
+
+  await Promise.all(
+    Array.from(candidates.keys()).map(async (url) => {
+      const resolved = await resolveImageUrl(url);
+      candidates.set(url, resolved);
+    })
+  );
+
+  return markdown.replace(
+    /!\[([^\]]*)\]\((https?:\/\/[^)]+)\)/g,
+    (full, alt, url) => {
+      const resolved = candidates.get(url.trim());
+      return resolved && resolved !== url.trim()
+        ? `![${alt}](${resolved})`
+        : full;
+    }
+  );
 }
 
 function validateCharmUrl(url: string): void {
@@ -427,11 +485,12 @@ function createServer(): McpServer {
     async ({ url }) => {
       validateCharmUrl(url);
       const markdown = await fetchMarkdown(url);
+      const resolved = await resolveMarkdownImageUrls(markdown);
       return {
         content: [
           {
             type: "text",
-            text: markdown,
+            text: resolved,
           },
         ],
       };
