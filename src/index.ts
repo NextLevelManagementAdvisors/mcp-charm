@@ -28,6 +28,48 @@ interface LinkEntry {
   url: string;
 }
 
+interface LaborTimeEntry {
+  component: string;
+  operation: string;
+  time_hours: number | null;
+  notes: string;
+  path: string;
+}
+
+function getDirectChildren(markdown: string, parentUrl: string): LinkEntry[] {
+  const links = extractCharmLinks(markdown, BASE_URL + "/");
+  const normalized = parentUrl.replace(/\/$/, "");
+  return links.filter((link) => {
+    if (!link.url.startsWith(normalized + "/")) return false;
+    if (link.url === normalized + "/") return false;
+    const remainder = link.url.slice(normalized.length + 1).replace(/\/$/, "");
+    return remainder.length > 0 && !remainder.includes("/");
+  });
+}
+
+function parseLaborTime(content: string): { time_hours: number | null; notes: string } {
+  const lc = content.toLowerCase();
+
+  // "included" means time is bundled with another operation
+  if (/\bincluded\b/.test(lc)) {
+    return { time_hours: null, notes: "included" };
+  }
+
+  // Look for overlap credit note
+  const overlapMatch = content.match(/overlap\s+credit[^.\n]*/i);
+
+  // Find first plausible decimal hour value (0.1 – 99.9)
+  const numMatch = content.match(/\b(\d{1,2}\.\d)\b/);
+  if (numMatch) {
+    const time_hours = parseFloat(numMatch[1]);
+    if (time_hours > 0 && time_hours < 100) {
+      return { time_hours, notes: overlapMatch ? overlapMatch[0].trim() : "" };
+    }
+  }
+
+  return { time_hours: null, notes: overlapMatch ? overlapMatch[0].trim() : "" };
+}
+
 function extractCharmLinks(markdown: string, pathPrefix?: string): LinkEntry[] {
   const linkPattern = /\[([^\]]+)\]\((https?:\/\/charm\.li\/[^)]+)\)/g;
   const seen = new Set<string>();
@@ -432,6 +474,250 @@ function createServer(): McpServer {
           {
             type: "text",
             text: markdown,
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "lookup_labor_time",
+    {
+      description:
+        "Look up labor times for a specific component on a vehicle from charm.li. " +
+        "Searches the Labor Times subtree for the given component keyword and returns " +
+        "structured operation/time data. The model parameter must match the exact path " +
+        "segment from browse_manuals or search_manuals (e.g. 'E450 Super Duty V10-6.8L'). " +
+        "Returns all operations for the component when operation is omitted.",
+      inputSchema: {
+        make: z
+          .string()
+          .min(1)
+          .describe('Car make, e.g. "Ford", "Toyota". Use list_makes for valid values.'),
+        year: z
+          .string()
+          .length(4)
+          .describe('4-digit model year, e.g. "2011".'),
+        model: z
+          .string()
+          .min(1)
+          .describe(
+            'Exact model path segment as returned by browse_manuals or search_manuals, e.g. "E450 Super Duty V10-6.8L".'
+          ),
+        component: z
+          .string()
+          .min(1)
+          .describe(
+            'Component name to search for (partial, case-insensitive), e.g. "Auxiliary A/C", "Water Pump", "Serpentine Belt".'
+          ),
+        operation: z
+          .string()
+          .optional()
+          .describe(
+            'Specific operation to filter by (partial, case-insensitive), e.g. "Remove & Replace", "Diagnosis", "Testing". Omit to return all operations.'
+          ),
+      },
+    },
+    async ({ make, year, model, component, operation }) => {
+      const vehicleUrl = charmUrl(`${make}/${year}/${model}`);
+
+      // Step 1: find the "Labor Times" section link on the vehicle page
+      let vehicleMarkdown: string;
+      try {
+        vehicleMarkdown = await fetchMarkdown(vehicleUrl);
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `Could not fetch vehicle page: ${vehicleUrl}`,
+                  hint: "Verify make/year/model using browse_manuals or search_manuals.",
+                  details: String(err),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const vehicleLinks = extractCharmLinks(vehicleMarkdown, BASE_URL + "/");
+      const laborTimesLink = vehicleLinks.find((l) =>
+        l.text.toLowerCase().includes("labor time")
+      );
+
+      if (!laborTimesLink) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `No "Labor Times" section found for ${make} ${year} ${model}.`,
+                  available_sections: vehicleLinks.map((l) => l.text),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Step 2: get the top-level categories under Labor Times
+      const ltMarkdown = await fetchMarkdown(laborTimesLink.url);
+      const categories = getDirectChildren(ltMarkdown, laborTimesLink.url);
+
+      if (categories.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: "No categories found under Labor Times.",
+                  labor_times_url: laborTimesLink.url,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const componentKeyword = component.toLowerCase();
+      const operationKeyword = operation?.toLowerCase();
+
+      // Step 3: fetch all category pages in parallel, collect component links
+      const categoryResults = await Promise.all(
+        categories.map(async (cat) => {
+          try {
+            const catMd = await fetchMarkdown(cat.url);
+            const children = getDirectChildren(catMd, cat.url);
+            const matching = children.filter((c) =>
+              c.text.toLowerCase().includes(componentKeyword)
+            );
+            return { category: cat, matching };
+          } catch {
+            return { category: cat, matching: [] };
+          }
+        })
+      );
+
+      const allMatches = categoryResults.flatMap((r) =>
+        r.matching.map((comp) => ({ category: r.category, comp }))
+      );
+
+      if (allMatches.length === 0) {
+        const allComponentNames = categoryResults.flatMap((r) =>
+          r.matching.length === 0
+            ? categoryResults
+                .find((cr) => cr.category.url === r.category.url)
+                ?.matching.map((c) => c.text) ?? []
+            : r.matching.map((c) => c.text)
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  results: [],
+                  count: 0,
+                  note: `No component matching "${component}" found under Labor Times for ${make} ${year} ${model}.`,
+                  searched_categories: categories.map((c) => c.text),
+                  labor_times_url: laborTimesLink.url,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Step 4: for each matching component, get its operation sub-pages
+      const results: LaborTimeEntry[] = [];
+
+      await Promise.all(
+        allMatches.map(async ({ comp }) => {
+          let compMd: string;
+          try {
+            compMd = await fetchMarkdown(comp.url);
+          } catch {
+            return;
+          }
+
+          const ops = getDirectChildren(compMd, comp.url);
+
+          if (ops.length === 0) {
+            // Component IS the leaf — parse time directly from its content
+            if (
+              !operationKeyword ||
+              comp.text.toLowerCase().includes(operationKeyword)
+            ) {
+              const parsed = parseLaborTime(compMd);
+              results.push({
+                component: comp.text,
+                operation: comp.text,
+                time_hours: parsed.time_hours,
+                notes: parsed.notes,
+                path: comp.url.replace(`${BASE_URL}/`, "").replace(/\/$/, ""),
+              });
+            }
+            return;
+          }
+
+          // Filter operations by keyword if provided
+          const targetOps = operationKeyword
+            ? ops.filter((op) =>
+                op.text.toLowerCase().includes(operationKeyword)
+              )
+            : ops;
+
+          // Step 5: fetch each operation page and parse the time
+          await Promise.all(
+            targetOps.map(async (op) => {
+              try {
+                const opContent = await fetchMarkdown(op.url);
+                const parsed = parseLaborTime(opContent);
+                results.push({
+                  component: comp.text,
+                  operation: op.text,
+                  time_hours: parsed.time_hours,
+                  notes: parsed.notes,
+                  path: op.url
+                    .replace(`${BASE_URL}/`, "")
+                    .replace(/\/$/, ""),
+                });
+              } catch {
+                // skip failed fetches
+              }
+            })
+          );
+        })
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                results,
+                count: results.length,
+                note:
+                  results.length === 0
+                    ? `Component "${component}" was found but no operations matched${operation ? ` filter "${operation}"` : ""}.`
+                    : undefined,
+              },
+              null,
+              2
+            ),
           },
         ],
       };
