@@ -7,7 +7,7 @@ import { z } from "zod";
 import { registerDiagramApp } from "./diagram-app.js";
 import { registerSkills } from "./skill-registry.js";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
