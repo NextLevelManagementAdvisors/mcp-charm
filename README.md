@@ -10,6 +10,18 @@ Fork of [Gonzih/mcp-charm](https://github.com/Gonzih/mcp-charm) (MIT). Changes f
 - Dockerfile for containerized deployment
 - Adds zod as an explicit dependency (upstream relied on hoisting)
 
+## Hosted endpoint
+
+Public instance: `https://manuals.nlma.io/mcp`
+
+HTTP mode requires the auth token in the URL (or as a Bearer header):
+
+```
+https://manuals.nlma.io/mcp?token=<MCP_AUTH_TOKEN>
+```
+
+A request without a valid token returns `401` with a `WWW-Authenticate: Bearer` challenge.
+
 ## Tools
 
 - `list_makes` — all vehicle makes
@@ -21,7 +33,7 @@ Fork of [Gonzih/mcp-charm](https://github.com/Gonzih/mcp-charm) (MIT). Changes f
 ## Environment
 
 - `LEMON_BASE_URLS` — comma-separated mirror list (default: `https://lemon-manuals.la,https://lemon-manuals.org.ua,https://lemon-manuals.gy`)
-- `MCP_AUTH_TOKEN` — if set, HTTP mode requires `Authorization: Bearer <token>`
+- `MCP_AUTH_TOKEN` — if set, HTTP mode requires the token via `Authorization: Bearer <token>` header **or** `?token=<token>` query param
 - `PORT` — HTTP port (default `8080`)
 - `MCP_TRANSPORT` — `http` or `stdio` (default `stdio`; CLI arg `http` also works)
 
