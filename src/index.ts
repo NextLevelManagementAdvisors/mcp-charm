@@ -98,7 +98,7 @@ interface LinkEntry {
 }
 
 function extractLinks(html: string, baseUrl: string): LinkEntry[] {
-  const re = /<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const re = /<a\s+[^>]*href=["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
   const seen = new Set<string>();
   const out: LinkEntry[] = [];
   let m: RegExpExecArray | null;
@@ -141,7 +141,7 @@ function htmlToMarkdown(html: string, baseUrl: string): string {
       return "";
     }
   });
-  s = s.replace(/<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
+  s = s.replace(/<a\s+[^>]*href=["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
     const t = decodeEntities(String(text).replace(/<[^>]+>/g, "").trim());
     try {
       const u = new URL(decodeEntities(String(href)), baseUrl);
