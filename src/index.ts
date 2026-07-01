@@ -269,8 +269,10 @@ function buildServer(): McpServer {
       const isChild = (l: LinkEntry) =>
         l.segments.length === parentSegs.length + 1 &&
         parentSegs.every((seg, i) => l.segments[i].toLowerCase() === seg.toLowerCase());
+      const isDownload = (l: LinkEntry) =>
+        /\.zip$/i.test(l.pathname) || /^\/bundle\//i.test(l.pathname);
       const entries = links
-        .filter((l) => isChild(l) && !/\.zip$/i.test(l.pathname))
+        .filter((l) => isChild(l) && !isDownload(l))
         .map((l) => ({
           name: l.segments[l.segments.length - 1],
           url: l.url,
@@ -278,7 +280,7 @@ function buildServer(): McpServer {
           type: "directory",
         }));
       const downloads = links
-        .filter((l) => /\.zip$/i.test(l.pathname))
+        .filter(isDownload)
         .map((l) => ({ name: l.text, url: l.url, type: "download" }));
       return {
         content: [
