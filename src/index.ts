@@ -7,7 +7,7 @@ import { z } from "zod";
 import { registerDiagramApp } from "./diagram-app.js";
 import { registerSkills } from "./skill-registry.js";
 
-const VERSION = "0.4.2";
+const VERSION = "0.5.0";
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
@@ -161,6 +161,103 @@ function htmlToMarkdown(html: string, baseUrl: string): string {
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
   return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+interface LaborTimeRow {
+  component: string;
+  operation: string;
+  applies_to: string;
+  time_hours: number | null;
+  warranty_hours: number | null;
+  skill_level: string;
+  notes: string;
+}
+
+const isDecimal = (s: string): boolean => /^\d+(\.\d+)?$/.test(s);
+
+function stripLaborCell(s: string): string {
+  return decodeEntities(s.replace(/<br\s*\/?>/gi, "; ").replace(/<[^>]+>/g, "")).trim();
+}
+
+// Labor Times leaf pages hold a title ("Component: Operation"), an optional
+// intro, and a table of hour rows. Rows can be interrupted by full-width
+// "Combination Procedure" separators that introduce a related component/
+// operation bundled onto the same page (e.g. a brake-hose bleed procedure
+// listed on the brake-pad R&R page) — track the active label as we walk rows.
+function parseLaborLeaf(html: string): LaborTimeRow[] {
+  const h1Match = html.match(/<h1>([\s\S]*?)<\/h1>/i);
+  const h1Text = h1Match ? decodeEntities(h1Match[1].replace(/<[^>]+>/g, "")).trim() : "";
+  const sepIdx = h1Text.indexOf(": ");
+  const pageComponent = sepIdx >= 0 ? h1Text.slice(0, sepIdx).trim() : h1Text;
+  const pageOperation = sepIdx >= 0 ? h1Text.slice(sepIdx + 2).trim() : "";
+
+  const tableMatch = html.match(/<table>([\s\S]*?)<\/table>/i);
+  if (!tableMatch) return [];
+  const tbodyMatch = tableMatch[1].match(/<tbody>([\s\S]*?)<\/tbody>/i);
+  const trs = (tbodyMatch ? tbodyMatch[1] : "").match(/<tr>[\s\S]*?<\/tr>/gi) ?? [];
+
+  const rows: LaborTimeRow[] = [];
+  let curComponent = pageComponent;
+  let curOperation = pageOperation;
+  let curGroupNote = "";
+
+  for (const tr of trs) {
+    const comboMatch = tr.match(/<td[^>]*\bcolspan=[^>]*>([\s\S]*?)<\/td>/i);
+    if (comboMatch) {
+      const cellHtml = comboMatch[1];
+      const labelMatch = cellHtml.match(/Combination Procedure:<\/b>\s*([^<]*)/i);
+      const label = labelMatch ? decodeEntities(labelMatch[1]).trim().replace(/:$/, "") : "";
+      curGroupNote = stripLaborCell(cellHtml.split(/<br\s*\/?>/i).slice(1).join(" "));
+      if (label) {
+        const idx = label.indexOf(": ");
+        if (idx >= 0) {
+          curComponent = label.slice(0, idx).trim();
+          curOperation = label.slice(idx + 2).trim();
+        } else {
+          curOperation = label;
+        }
+      }
+      continue;
+    }
+    const cells = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => stripLaborCell(m[1]));
+    if (cells.length < 5) continue;
+    const [appliesTo, note, stdHours, warHours, skill] = cells;
+    const noteParts = [curGroupNote, note].filter(Boolean);
+    if (stdHours && !isDecimal(stdHours)) noteParts.push(`standard hours: ${stdHours}`);
+    rows.push({
+      component: curComponent,
+      operation: curOperation,
+      applies_to: appliesTo,
+      time_hours: isDecimal(stdHours) ? parseFloat(stdHours) : null,
+      warranty_hours: isDecimal(warHours) ? parseFloat(warHours) : null,
+      skill_level: skill,
+      notes: noteParts.join("; "),
+    });
+  }
+  return rows;
+}
+
+// A model's own Labor Times page sometimes has no data and instead points to
+// an "Other Variant" (a mechanically-identical trim) that carries the real
+// table. Follow that redirect transparently and report the substitution.
+async function resolveLaborTimesTree(
+  basePath: string
+): Promise<{ html: string; finalUrl: string; sourceVariant?: string }> {
+  const { html, finalUrl } = await fetchDir(`${basePath}/Labor Times`);
+  if (!/only available for a different vehicle variant/i.test(html)) {
+    return { html, finalUrl };
+  }
+  const otherVariant = extractLinks(html, finalUrl).find(
+    (l) => l.segments[l.segments.length - 1]?.toLowerCase() === "other variant"
+  );
+  if (!otherVariant) return { html, finalUrl };
+  const variantMatch = html.match(/Variant with labor times:<\/b>\s*([^<]+)/i);
+  const { html: vh, finalUrl: vu } = await fetchUrl(otherVariant.url);
+  return {
+    html: vh,
+    finalUrl: vu,
+    sourceVariant: variantMatch ? decodeEntities(variantMatch[1]).trim() : undefined,
+  };
 }
 
 function buildServer(): McpServer {
@@ -474,6 +571,107 @@ function buildServer(): McpServer {
           {
             type: "text",
             text: htmlToMarkdown(html, finalUrl),
+          },
+        ],
+      };
+    }
+  );
+
+  // Tool 6: lookup_labor_time
+  server.registerTool(
+    "lookup_labor_time",
+    {
+      description:
+        'Look up structured labor times (standard/warranty hours, skill level) for a component on a specific vehicle, without manually navigating the Labor Times tree. Searches the whole Labor Times subtree for leaf pages whose component name contains the given keyword (case-insensitive substring match), optionally narrowed by an operation keyword (e.g. "Remove & Replace", "Diagnosis", "Testing"). If labor times for the exact requested trim are only published under a related variant, that substitute is used automatically and reported in the result as "variant_used".',
+      inputSchema: {
+        make: z.string().min(1).describe('Vehicle make, e.g. "Ford".'),
+        year: z.string().min(1).describe('Model year, e.g. "2011".'),
+        model: z
+          .string()
+          .min(1)
+          .describe(
+            'Exact model/trim path segment as returned by browse_manuals or search_manuals, e.g. "E450 Super Duty 6.8 S, Gas".'
+          ),
+        component: z
+          .string()
+          .min(1)
+          .describe('Component keyword, matched case-insensitively as a substring, e.g. "HVAC Door Actuator" or "Brake Pad".'),
+        operation: z
+          .string()
+          .optional()
+          .describe('Optional operation keyword filter, e.g. "Remove & Replace", "Diagnosis", "Testing".'),
+      },
+    },
+    async ({ make, year, model, component, operation }) => {
+      const basePath = [make, year, model].join("/");
+      const { html, finalUrl, sourceVariant } = await resolveLaborTimesTree(basePath);
+
+      const treeBaseSegs = pathSegments(new URL(finalUrl).pathname);
+      const componentNorm = component.trim().toLowerCase();
+      const operationNorm = operation?.trim().toLowerCase();
+
+      const leafLinks = extractLinks(html, finalUrl).filter((l) => {
+        if (l.segments.length < treeBaseSegs.length + 2) return false;
+        if (!treeBaseSegs.every((seg, i) => l.segments[i].toLowerCase() === seg.toLowerCase())) return false;
+        const componentSeg = l.segments[l.segments.length - 2];
+        const operationSeg = l.segments[l.segments.length - 1];
+        if (!componentSeg.toLowerCase().includes(componentNorm)) return false;
+        if (operationNorm && !operationSeg.toLowerCase().includes(operationNorm)) return false;
+        return true;
+      });
+
+      const MAX_LEAVES = 30;
+      const truncated = leafLinks.length > MAX_LEAVES;
+      const targets = leafLinks.slice(0, MAX_LEAVES);
+
+      const pages = await Promise.all(
+        targets.map(async (l) => {
+          try {
+            const { html: leafHtml } = await fetchUrl(l.url);
+            return { link: l, rows: parseLaborLeaf(leafHtml) };
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      const results = pages
+        .filter((p): p is { link: LinkEntry; rows: LaborTimeRow[] } => p !== null)
+        .flatMap((p) =>
+          p.rows
+            .filter((row) => !operationNorm || row.operation.toLowerCase().includes(operationNorm))
+            .map((row) => ({
+              ...row,
+              source_variant: sourceVariant,
+              path: p.link.segments.join("/"),
+            }))
+        );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                make,
+                year,
+                model,
+                component,
+                operation: operation ?? null,
+                variant_used: sourceVariant ?? model,
+                results,
+                count: results.length,
+                truncated,
+                note:
+                  results.length === 0
+                    ? `No labor time entries found for "${component}"${operation ? ` / "${operation}"` : ""}. Try a broader keyword, or use browse_manuals with path "${basePath}/Labor Times" to explore the tree.`
+                    : truncated
+                      ? `Component keyword matched more than ${MAX_LEAVES} pages; only the first ${MAX_LEAVES} were fetched. Narrow the component or operation keyword for full coverage.`
+                      : undefined,
+              },
+              null,
+              2
+            ),
           },
         ],
       };

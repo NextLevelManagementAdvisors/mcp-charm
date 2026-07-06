@@ -29,6 +29,7 @@ A request without a valid token returns `401` with a `WWW-Authenticate: Bearer` 
 - `browse_manuals(path)` — e.g. `Ford/2018` or `Ford/2018/F 150 4WD V8-5.0L`
 - `search_manuals(make, query)` — e.g. `search_manuals("Ford", "2018 F-150")`
 - `get_manual_content(url)` — page content as markdown (procedures, images, section links, zip downloads)
+- `lookup_labor_time(make, year, model, component, operation?)` — structured labor times (hours, skill level) for a component, without manually navigating the Labor Times tree
 
 ## Environment
 
