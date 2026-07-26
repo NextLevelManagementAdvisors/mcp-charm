@@ -6,6 +6,14 @@ import express from "express";
 import { z } from "zod";
 import { registerDiagramApp } from "./diagram-app.js";
 import { registerSkills } from "./skill-registry.js";
+import {
+  decodeEntities,
+  pathSegments,
+  encodePath,
+  extractLinks as extractLinksPure,
+  computeBrowseEntries,
+  type LinkEntry,
+} from "./browse-links.js";
 
 const VERSION = "0.5.0";
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
@@ -22,39 +30,8 @@ const BASES: string[] = (
 const ALLOWED_ORIGINS = BASES.map((b) => new URL(b).origin);
 const PRIMARY = BASES[0];
 
-// Non-content pages to skip when extracting links.
-const SKIP_PATHS = new Set([
-  "",
-  "nfo.html",
-  "about.html",
-  "bittorrent.html",
-  "index.html",
-  "lemon-manuals.torrent",
-]);
-
-function decodeEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#0?39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&nbsp;/g, " ");
-}
-
-function pathSegments(path: string): string[] {
-  return path
-    .replace(/^\/+|\/+$/g, "")
-    .split("/")
-    .filter(Boolean)
-    .map((s) => decodeURIComponent(s));
-}
-
-function encodePath(path: string): string {
-  return pathSegments(path)
-    .map((seg) => encodeURIComponent(seg))
-    .join("/");
+function extractLinks(html: string, baseUrl: string): LinkEntry[] {
+  return extractLinksPure(html, baseUrl, ALLOWED_ORIGINS);
 }
 
 // Case/hyphen/space-insensitive matching: "F-150" matches "F 150" and "f150".
@@ -90,43 +67,30 @@ async function fetchDir(path: string): Promise<{ html: string; finalUrl: string 
   return fetchUrl(target);
 }
 
-interface LinkEntry {
-  text: string;
-  url: string;
-  pathname: string;
-  segments: string[];
-}
-
-function extractLinks(html: string, baseUrl: string): LinkEntry[] {
-  const re = /<a\s+[^>]*href=["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
-  const seen = new Set<string>();
-  const out: LinkEntry[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    const rawHref = decodeEntities(m[1].trim());
-    const text = decodeEntities(m[2].replace(/<[^>]+>/g, "").trim());
-    if (!text || rawHref.startsWith("javascript:") || rawHref.startsWith("#")) continue;
-    let u: URL;
-    try {
-      u = new URL(rawHref, baseUrl);
-    } catch {
-      continue;
+async function fetchDirResilient(
+  path: string
+): Promise<{ html: string; finalUrl: string; fetchedSegs: string[] }> {
+  const segs = pathSegments(path);
+  try {
+    const { html, finalUrl } = await fetchDir(path);
+    return { html, finalUrl, fetchedSegs: segs };
+  } catch (err) {
+    // Some LEMON templates nest real content under plain-text category
+    // headers with no page of their own (#22). A path built from one of
+    // those synthetic headers won't resolve directly — walk up to the
+    // nearest real ancestor page and let the caller re-filter its links
+    // against the full requested path instead.
+    for (let pop = 1; pop < segs.length; pop++) {
+      const ancestorSegs = segs.slice(0, segs.length - pop);
+      try {
+        const { html, finalUrl } = await fetchDir(ancestorSegs.join("/"));
+        return { html, finalUrl, fetchedSegs: ancestorSegs };
+      } catch {
+        // try a shallower ancestor
+      }
     }
-    if (!ALLOWED_ORIGINS.includes(u.origin)) continue;
-    const pathname = u.pathname.replace(/\/+$/, "");
-    const tail = pathname.replace(/^\/+/, "");
-    if (SKIP_PATHS.has(tail.toLowerCase())) continue;
-    const key = pathname; // dedupe across mirrors by path
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      text,
-      url: u.toString(),
-      pathname,
-      segments: pathSegments(pathname),
-    });
+    throw err;
   }
-  return out;
 }
 
 function htmlToMarkdown(html: string, baseUrl: string): string {
@@ -360,25 +324,24 @@ function buildServer(): McpServer {
       },
     },
     async ({ path }) => {
-      const { html, finalUrl } = await fetchDir(path);
-      const links = extractLinks(html, finalUrl);
       const parentSegs = pathSegments(path);
-      const isChild = (l: LinkEntry) =>
-        l.segments.length === parentSegs.length + 1 &&
-        parentSegs.every((seg, i) => l.segments[i].toLowerCase() === seg.toLowerCase());
+      const { html, finalUrl, fetchedSegs } = await fetchDirResilient(path);
+      const links = extractLinks(html, finalUrl);
       const isDownload = (l: LinkEntry) =>
         /\.zip$/i.test(l.pathname) || /^\/bundle\//i.test(l.pathname);
-      const entries = links
-        .filter((l) => isChild(l) && !isDownload(l))
-        .map((l) => ({
-          name: l.segments[l.segments.length - 1],
-          url: l.url,
-          path: l.segments.join("/"),
-          type: "directory",
-        }));
+      const entries = computeBrowseEntries(parentSegs, links);
       const downloads = links
         .filter(isDownload)
         .map((l) => ({ name: l.text, url: l.url, type: "download" }));
+
+      const syntheticCount = entries.filter((e) => e.synthetic).length;
+      const usedAncestor = fetchedSegs.length !== parentSegs.length;
+      const note = syntheticCount > 0
+        ? `${syntheticCount} ${syntheticCount === 1 ? "entry is" : "entries are"} a category label with no page of its own — its content is nested deeper. Call browse_manuals again with that entry's "path" to keep drilling down, or use get_manual_content on "${finalUrl}" to see the whole subtree at once.`
+        : usedAncestor
+          ? `"${path}" has no page of its own; showing categories nested under "${fetchedSegs.join("/")}".`
+          : undefined;
+
       return {
         content: [
           {
@@ -389,6 +352,7 @@ function buildServer(): McpServer {
                 url: finalUrl,
                 entries: [...entries, ...downloads],
                 count: entries.length + downloads.length,
+                note,
               },
               null,
               2
