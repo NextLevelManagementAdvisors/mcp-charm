@@ -1,12 +1,14 @@
 import { App, type McpUiHostContext } from "@modelcontextprotocol/ext-apps";
 
+declare const __APP_VERSION__: string;
+
 interface Figure {
   url: string;
   caption: string;
 }
 
 const root = document.getElementById("root")!;
-const app = new App({ name: "Manual Diagram Viewer", version: "0.3.0" });
+const app = new App({ name: "Manual Diagram Viewer", version: __APP_VERSION__ });
 
 function applyTheme(ctx?: McpUiHostContext): void {
   if (ctx?.theme) document.documentElement.dataset.theme = ctx.theme;

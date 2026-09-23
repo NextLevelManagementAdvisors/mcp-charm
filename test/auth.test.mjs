@@ -99,3 +99,17 @@ test("valid token via Authorization Bearer is accepted (not 401)", async () => {
   });
   assert.notEqual(res.status, 401);
 });
+
+test("HTTP transport refuses to start with no MCP_AUTH_TOKEN and no ALLOW_NO_AUTH", async () => {
+  const port = await freePort();
+  const noAuthChild = spawn(process.execPath, [ENTRY, "http"], {
+    env: Object.assign({}, process.env, {
+      MCP_TRANSPORT: "http",
+      PORT: String(port),
+      MCP_AUTH_TOKEN: "",
+    }),
+    stdio: "ignore",
+  });
+  const exitCode = await new Promise((resolve) => noAuthChild.on("exit", resolve));
+  assert.equal(exitCode, 1);
+});
