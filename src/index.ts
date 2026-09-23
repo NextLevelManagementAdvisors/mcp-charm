@@ -19,6 +19,7 @@ import {
   type LinkEntry,
 } from "./browse-links.js";
 import { parseLaborLeaf, type LaborTimeRow } from "./labor-parser.js";
+import { createResilientFetcher, fetchDirResilient as fetchDirResilientCore } from "./resilient-fetch.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf-8")).version;
@@ -45,27 +46,7 @@ function normalizeForMatch(s: string): string {
   return s.toLowerCase().replace(/[-\s]+/g, "");
 }
 
-async function fetchUrl(target: string): Promise<{ html: string; finalUrl: string }> {
-  const u = new URL(target);
-  if (!ALLOWED_ORIGINS.includes(u.origin)) {
-    throw new Error(`URL origin must be one of: ${ALLOWED_ORIGINS.join(", ")} — got ${u.origin}`);
-  }
-  const ordered = [u.origin, ...ALLOWED_ORIGINS.filter((o) => o !== u.origin)];
-  let lastErr: unknown;
-  for (const origin of ordered) {
-    const candidate = origin + u.pathname + u.search;
-    try {
-      const res = await fetch(candidate, {
-        headers: { "User-Agent": UA, Accept: "text/html" },
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${candidate}`);
-      return { html: await res.text(), finalUrl: candidate };
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw new Error(`All mirrors failed for ${u.pathname}: ${String(lastErr)}`);
-}
+const { fetchUrl } = createResilientFetcher(ALLOWED_ORIGINS, UA);
 
 async function fetchDir(path: string): Promise<{ html: string; finalUrl: string }> {
   const encoded = encodePath(path);
@@ -76,27 +57,7 @@ async function fetchDir(path: string): Promise<{ html: string; finalUrl: string 
 async function fetchDirResilient(
   path: string
 ): Promise<{ html: string; finalUrl: string; fetchedSegs: string[] }> {
-  const segs = pathSegments(path);
-  try {
-    const { html, finalUrl } = await fetchDir(path);
-    return { html, finalUrl, fetchedSegs: segs };
-  } catch (err) {
-    // Some LEMON templates nest real content under plain-text category
-    // headers with no page of their own (#22). A path built from one of
-    // those synthetic headers won't resolve directly — walk up to the
-    // nearest real ancestor page and let the caller re-filter its links
-    // against the full requested path instead.
-    for (let pop = 1; pop < segs.length; pop++) {
-      const ancestorSegs = segs.slice(0, segs.length - pop);
-      try {
-        const { html, finalUrl } = await fetchDir(ancestorSegs.join("/"));
-        return { html, finalUrl, fetchedSegs: ancestorSegs };
-      } catch {
-        // try a shallower ancestor
-      }
-    }
-    throw err;
-  }
+  return fetchDirResilientCore(fetchDir, path, pathSegments);
 }
 
 function htmlToMarkdown(html: string, baseUrl: string): string {
@@ -397,6 +358,7 @@ function buildServer(): McpServer {
       const keyword = query.replace(/\b(19|20)\d{2}\b/, "").trim();
       const keywordNorm = normalizeForMatch(keyword);
       const results: Array<{ make: string; year: string; model: string; url: string; path: string }> = [];
+      let failedPages = 0;
 
       await Promise.all(
         yearsToSearch.map(async (yearEntry) => {
@@ -422,7 +384,7 @@ function buildServer(): McpServer {
               }
             }
           } catch {
-            // skip years that fail
+            failedPages++;
           }
         })
       );
@@ -432,6 +394,15 @@ function buildServer(): McpServer {
         if (yearDiff !== 0) return yearDiff;
         return a.model.localeCompare(b.model);
       });
+
+      const note =
+        results.length === 0 && failedPages === yearsToSearch.length
+          ? `Could not reach LEMON Manuals for any of ${failedPages} year(s) searched — upstream may be down. This is not a "no results" answer; do not treat it as one.`
+          : results.length === 0
+            ? `No manuals found matching "${query}" for ${make}.`
+            : failedPages > 0
+              ? `${failedPages} of ${yearsToSearch.length} year(s) could not be fetched and were skipped; results may be incomplete.`
+              : undefined;
 
       return {
         content: [
@@ -443,7 +414,8 @@ function buildServer(): McpServer {
                 query,
                 results,
                 count: results.length,
-                note: results.length === 0 ? `No manuals found matching "${query}" for ${make}.` : undefined,
+                failed_pages: failedPages,
+                note,
               },
               null,
               2
@@ -538,6 +510,8 @@ function buildServer(): McpServer {
         })
       );
 
+      const failedPages = pages.filter((p) => p === null).length;
+
       const results = pages
         .filter((p): p is { link: LinkEntry; rows: LaborTimeRow[] } => p !== null)
         .flatMap((p) =>
@@ -549,6 +523,17 @@ function buildServer(): McpServer {
               path: p.link.segments.join("/"),
             }))
         );
+
+      const note =
+        results.length === 0 && failedPages > 0 && failedPages === targets.length
+          ? `Could not reach LEMON Manuals for any of ${failedPages} matching page(s) — upstream may be down. This is not a "no entries" answer; do not treat it as one.`
+          : results.length === 0
+            ? `No labor time entries found for "${component}"${operation ? ` / "${operation}"` : ""}. Try a broader keyword, or use browse_manuals with path "${basePath}/Labor Times" to explore the tree.`
+            : truncated
+              ? `Component keyword matched more than ${MAX_LEAVES} pages; only the first ${MAX_LEAVES} were fetched. Narrow the component or operation keyword for full coverage.`
+              : failedPages > 0
+                ? `${failedPages} of ${targets.length} matching page(s) could not be fetched and were skipped; results may be incomplete.`
+                : undefined;
 
       return {
         content: [
@@ -564,13 +549,9 @@ function buildServer(): McpServer {
                 variant_used: sourceVariant ?? model,
                 results,
                 count: results.length,
+                failed_pages: failedPages,
                 truncated,
-                note:
-                  results.length === 0
-                    ? `No labor time entries found for "${component}"${operation ? ` / "${operation}"` : ""}. Try a broader keyword, or use browse_manuals with path "${basePath}/Labor Times" to explore the tree.`
-                    : truncated
-                      ? `Component keyword matched more than ${MAX_LEAVES} pages; only the first ${MAX_LEAVES} were fetched. Narrow the component or operation keyword for full coverage.`
-                      : undefined,
+                note,
               },
               null,
               2
@@ -620,8 +601,23 @@ async function runHttp() {
   const app = express();
   app.use(express.json({ limit: "4mb" }));
 
-  app.get("/health", (_req, res) => {
-    res.json({ ok: true, service: "lemon-mcp", version: VERSION, mirrors: BASES });
+  app.get("/health", async (req, res) => {
+    if (req.query.deep !== "1") {
+      res.json({ ok: true, service: "lemon-mcp", version: VERSION, mirrors: BASES });
+      return;
+    }
+    try {
+      const { finalUrl } = await fetchDir("");
+      res.json({ ok: true, service: "lemon-mcp", version: VERSION, mirrors: BASES, probed: finalUrl });
+    } catch (err) {
+      res.status(503).json({
+        ok: false,
+        service: "lemon-mcp",
+        version: VERSION,
+        mirrors: BASES,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 
   app.all("/mcp", async (req, res) => {
