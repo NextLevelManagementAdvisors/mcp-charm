@@ -46,13 +46,13 @@ export const SKIP_PATHS = new Set([
 ]);
 
 export function extractLinks(html: string, baseUrl: string, allowedOrigins: string[]): LinkEntry[] {
-  const re = /<a\s+[^>]*href=["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
+  const re = /<a\s+[^>]*?href=(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>([\s\S]*?)<\/a>/gi;
   const seen = new Set<string>();
   const out: LinkEntry[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    const rawHref = decodeEntities(m[1].trim());
-    const text = decodeEntities(m[2].replace(/<[^>]+>/g, "").trim());
+    const rawHref = decodeEntities((m[1] ?? m[2] ?? m[3] ?? "").trim());
+    const text = decodeEntities(m[4].replace(/<[^>]+>/g, "").trim());
     if (!text || rawHref.startsWith("javascript:") || rawHref.startsWith("#")) continue;
     let u: URL;
     try {

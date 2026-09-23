@@ -4,6 +4,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { registerDiagramApp } from "./diagram-app.js";
 import { registerSkills } from "./skill-registry.js";
 import {
@@ -14,8 +18,10 @@ import {
   computeBrowseEntries,
   type LinkEntry,
 } from "./browse-links.js";
+import { parseLaborLeaf, type LaborTimeRow } from "./labor-parser.js";
 
-const VERSION = "0.5.0";
+const HERE = dirname(fileURLToPath(import.meta.url));
+const VERSION: string = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf-8")).version;
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
@@ -98,23 +104,28 @@ function htmlToMarkdown(html: string, baseUrl: string): string {
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<!--[\s\S]*?-->/g, "");
-  s = s.replace(/<img[^>]*src="([^"]+)"[^>]*>/gi, (_m, src) => {
+  s = s.replace(/<img[^>]*?src=(?:"([^"]*)"|'([^']*)')[^>]*>/gi, (_m, src1, src2) => {
+    const src = src1 ?? src2;
     try {
       return `![image](${new URL(decodeEntities(String(src)), baseUrl).toString()})`;
     } catch {
       return "";
     }
   });
-  s = s.replace(/<a\s+[^>]*href=["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
-    const t = decodeEntities(String(text).replace(/<[^>]+>/g, "").trim());
-    try {
-      const u = new URL(decodeEntities(String(href)), baseUrl);
-      if (u.protocol === "javascript:") return t;
-      return `[${t}](${u.toString()})`;
-    } catch {
-      return t;
+  s = s.replace(
+    /<a\s+[^>]*?href=(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>([\s\S]*?)<\/a>/gi,
+    (_m, h1, h2, h3, text) => {
+      const href = h1 ?? h2 ?? h3;
+      const t = decodeEntities(String(text).replace(/<[^>]+>/g, "").trim());
+      try {
+        const u = new URL(decodeEntities(String(href)), baseUrl);
+        if (u.protocol === "javascript:") return t;
+        return `[${t}](${u.toString()})`;
+      } catch {
+        return t;
+      }
     }
-  });
+  );
   s = s
     .replace(/<h([1-6])[^>]*>/gi, (_m, n) => `\n\n${"#".repeat(Number(n))} `)
     .replace(/<\/h[1-6]>/gi, "\n");
@@ -125,80 +136,6 @@ function htmlToMarkdown(html: string, baseUrl: string): string {
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
   return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-interface LaborTimeRow {
-  component: string;
-  operation: string;
-  applies_to: string;
-  time_hours: number | null;
-  warranty_hours: number | null;
-  skill_level: string;
-  notes: string;
-}
-
-const isDecimal = (s: string): boolean => /^\d+(\.\d+)?$/.test(s);
-
-function stripLaborCell(s: string): string {
-  return decodeEntities(s.replace(/<br\s*\/?>/gi, "; ").replace(/<[^>]+>/g, "")).trim();
-}
-
-// Labor Times leaf pages hold a title ("Component: Operation"), an optional
-// intro, and a table of hour rows. Rows can be interrupted by full-width
-// "Combination Procedure" separators that introduce a related component/
-// operation bundled onto the same page (e.g. a brake-hose bleed procedure
-// listed on the brake-pad R&R page) — track the active label as we walk rows.
-function parseLaborLeaf(html: string): LaborTimeRow[] {
-  const h1Match = html.match(/<h1>([\s\S]*?)<\/h1>/i);
-  const h1Text = h1Match ? decodeEntities(h1Match[1].replace(/<[^>]+>/g, "")).trim() : "";
-  const sepIdx = h1Text.indexOf(": ");
-  const pageComponent = sepIdx >= 0 ? h1Text.slice(0, sepIdx).trim() : h1Text;
-  const pageOperation = sepIdx >= 0 ? h1Text.slice(sepIdx + 2).trim() : "";
-
-  const tableMatch = html.match(/<table>([\s\S]*?)<\/table>/i);
-  if (!tableMatch) return [];
-  const tbodyMatch = tableMatch[1].match(/<tbody>([\s\S]*?)<\/tbody>/i);
-  const trs = (tbodyMatch ? tbodyMatch[1] : "").match(/<tr>[\s\S]*?<\/tr>/gi) ?? [];
-
-  const rows: LaborTimeRow[] = [];
-  let curComponent = pageComponent;
-  let curOperation = pageOperation;
-  let curGroupNote = "";
-
-  for (const tr of trs) {
-    const comboMatch = tr.match(/<td[^>]*\bcolspan=[^>]*>([\s\S]*?)<\/td>/i);
-    if (comboMatch) {
-      const cellHtml = comboMatch[1];
-      const labelMatch = cellHtml.match(/Combination Procedure:<\/b>\s*([^<]*)/i);
-      const label = labelMatch ? decodeEntities(labelMatch[1]).trim().replace(/:$/, "") : "";
-      curGroupNote = stripLaborCell(cellHtml.split(/<br\s*\/?>/i).slice(1).join(" "));
-      if (label) {
-        const idx = label.indexOf(": ");
-        if (idx >= 0) {
-          curComponent = label.slice(0, idx).trim();
-          curOperation = label.slice(idx + 2).trim();
-        } else {
-          curOperation = label;
-        }
-      }
-      continue;
-    }
-    const cells = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => stripLaborCell(m[1]));
-    if (cells.length < 5) continue;
-    const [appliesTo, note, stdHours, warHours, skill] = cells;
-    const noteParts = [curGroupNote, note].filter(Boolean);
-    if (stdHours && !isDecimal(stdHours)) noteParts.push(`standard hours: ${stdHours}`);
-    rows.push({
-      component: curComponent,
-      operation: curOperation,
-      applies_to: appliesTo,
-      time_hours: isDecimal(stdHours) ? parseFloat(stdHours) : null,
-      warranty_hours: isDecimal(warHours) ? parseFloat(warHours) : null,
-      skill_level: skill,
-      notes: noteParts.join("; "),
-    });
-  }
-  return rows;
 }
 
 // A model's own Labor Times page sometimes has no data and instead points to
@@ -452,7 +389,9 @@ function buildServer(): McpServer {
           };
         }
       } else {
-        yearsToSearch = yearEntries.slice(-5);
+        yearsToSearch = [...yearEntries]
+          .sort((a, b) => parseInt(a.segments[1], 10) - parseInt(b.segments[1], 10))
+          .slice(-5);
       }
 
       const keyword = query.replace(/\b(19|20)\d{2}\b/, "").trim();
@@ -651,10 +590,35 @@ async function runStdio() {
   await server.connect(transport);
 }
 
+// Constant-time string compare so token checks don't leak timing info about
+// how many leading bytes matched. timingSafeEqual throws on length mismatch,
+// so unequal-length inputs are rejected up front (that early-out is on
+// length only, not content, so it doesn't leak the token itself).
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
 async function runHttp() {
+  const token = process.env.MCP_AUTH_TOKEN;
+
+  if (!token) {
+    if (process.env.ALLOW_NO_AUTH !== "1") {
+      console.error(
+        "MCP_AUTH_TOKEN is not set. Refusing to start the HTTP transport without auth. " +
+          "Set MCP_AUTH_TOKEN, or set ALLOW_NO_AUTH=1 to explicitly run without auth (not recommended)."
+      );
+      process.exit(1);
+    }
+    console.error(
+      "WARNING: MCP_AUTH_TOKEN is not set and ALLOW_NO_AUTH=1 — the HTTP transport is running with NO authentication."
+    );
+  }
+
   const app = express();
   app.use(express.json({ limit: "4mb" }));
-  const token = process.env.MCP_AUTH_TOKEN;
 
   app.get("/health", (_req, res) => {
     res.json({ ok: true, service: "lemon-mcp", version: VERSION, mirrors: BASES });
@@ -665,8 +629,8 @@ async function runHttp() {
       const auth = req.headers.authorization ?? "";
       const qpRaw = req.query.token;
       const qp = Array.isArray(qpRaw) ? qpRaw[0] : qpRaw;
-      const headerOk = auth === `Bearer ${token}`;
-      const queryOk = typeof qp === "string" && qp === token;
+      const headerOk = auth.startsWith("Bearer ") && safeEqual(auth.slice("Bearer ".length), token);
+      const queryOk = typeof qp === "string" && safeEqual(qp, token);
       if (!headerOk && !queryOk) {
         res
           .status(401)
@@ -687,7 +651,7 @@ async function runHttp() {
     } catch (err) {
       console.error("MCP request error:", err);
       if (!res.headersSent) {
-        res.status(500).json({ error: String(err) });
+        res.status(500).json({ error: "Internal server error" });
       }
     }
   });

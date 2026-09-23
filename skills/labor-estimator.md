@@ -7,7 +7,7 @@ description: "Auto shop labor time lookup and repair estimate builder. Use when 
 
 Build OEM-sourced labor estimates. Always pull times from the manual — never guess or use memory.
 
-**Why this matters:** Labor guides from ALLDATA, Mitchell, or printed books cost shops ,000+/year. The OEM manual labor times section is the same source, and it's available via the Vehicle Manuals MCP.
+**Why this matters:** Labor guides from ALLDATA, Mitchell, or printed books cost shops $2,000+/year. The OEM manual labor times section is the same source, and it's available via the Vehicle Manuals MCP.
 
 ## Inputs Required
 

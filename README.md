@@ -30,6 +30,11 @@ A request without a valid token returns `401` with a `WWW-Authenticate: Bearer` 
 - `search_manuals(make, query)` — e.g. `search_manuals("Ford", "2018 F-150")`
 - `get_manual_content(url)` — page content as markdown (procedures, images, section links, zip downloads)
 - `lookup_labor_time(make, year, model, component, operation?)` — structured labor times (hours, skill level) for a component, without manually navigating the Labor Times tree
+- `show_manual_diagrams(url)` — MCP App: renders the diagrams/figures from a manual page as an interactive, zoomable gallery inline (MCP-Apps-capable hosts only)
+- `list_skills()` — list the bundled auto-technician skills (name + description)
+- `get_skill(name)` — full markdown of a bundled skill by name
+
+Bundled skills are also exposed as `skill://<name>` resources for clients that read resources directly instead of calling `get_skill`.
 
 ## Environment
 

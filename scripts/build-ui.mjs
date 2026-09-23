@@ -9,6 +9,8 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, "..");
 
+const { version } = JSON.parse(await readFile(join(repo, "package.json"), "utf-8"));
+
 const result = await build({
   entryPoints: [join(repo, "ui", "diagram-viewer.ts")],
   bundle: true,
@@ -17,6 +19,7 @@ const result = await build({
   target: "es2020",
   minify: true,
   write: false,
+  define: { __APP_VERSION__: JSON.stringify(version) },
 });
 const js = result.outputFiles[0].text;
 

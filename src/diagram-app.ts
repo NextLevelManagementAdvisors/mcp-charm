@@ -42,8 +42,9 @@ function decodeEntities(s: string): string {
 }
 
 function attr(tag: string, name: string): string | undefined {
-  const m = tag.match(new RegExp(`\\s${name}="([^"]*)"`, "i"));
-  return m ? decodeEntities(m[1]) : undefined;
+  const m = tag.match(new RegExp(`\\s${name}=(?:"([^"]*)"|'([^']*)')`, "i"));
+  if (!m) return undefined;
+  return decodeEntities(m[1] ?? m[2]);
 }
 
 // Pull every <img> off a manual page, absolutize the src against the page URL,
