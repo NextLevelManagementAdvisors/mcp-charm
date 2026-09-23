@@ -20,6 +20,16 @@ import {
 } from "./browse-links.js";
 import { parseLaborLeaf, type LaborTimeRow } from "./labor-parser.js";
 import { createResilientFetcher, fetchDirResilient as fetchDirResilientCore } from "./resilient-fetch.js";
+import {
+  findWrapperImageUrls,
+  substituteImageUrls,
+  extractImageSrc,
+  parseDtcTableHtml,
+  tokenizeSymptom,
+  scoreText,
+  relevanceScore,
+  extractSnippet,
+} from "./diagnosis.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf-8")).version;
@@ -120,6 +130,88 @@ async function resolveLaborTimesTree(
     finalUrl: vu,
     sourceVariant: variantMatch ? decodeEntities(variantMatch[1]).trim() : undefined,
   };
+}
+
+// Links exactly one path segment deeper than `parentSegs`, whose leading
+// segments match — i.e. the direct children of that directory node.
+function directChildren(links: LinkEntry[], parentSegs: string[]): LinkEntry[] {
+  return links.filter(
+    (l) =>
+      l.segments.length === parentSegs.length + 1 &&
+      parentSegs.every((seg, i) => l.segments[i]?.toLowerCase() === seg.toLowerCase())
+  );
+}
+
+// Every link nested below `parentSegs` at any depth. LEMON directory pages
+// render the whole subtree of anchors, so descendants of a section index are
+// usually all present on that one page (this is what browse_manuals' synthetic
+// categories rely on, #22).
+function descendantLinks(links: LinkEntry[], parentSegs: string[]): LinkEntry[] {
+  return links.filter(
+    (l) =>
+      l.segments.length > parentSegs.length &&
+      parentSegs.every((seg, i) => l.segments[i]?.toLowerCase() === seg.toLowerCase())
+  );
+}
+
+// Resolve a make/year + model keyword to the model's directory entry. The
+// keyword is matched case/hyphen/space-insensitively against the model path
+// segment, so "E450" matches "E450 Super Duty 6.8 S, Gas".
+async function locateModel(
+  make: string,
+  year: string,
+  modelKeyword: string
+): Promise<{ modelEntry: LinkEntry | null; available: string[] }> {
+  const { html, finalUrl } = await fetchDir(`${make}/${year}`);
+  const makeLower = make.trim().toLowerCase();
+  const modelLinks = extractLinks(html, finalUrl).filter(
+    (l) =>
+      l.segments.length === 3 &&
+      l.segments[0].toLowerCase() === makeLower &&
+      l.segments[1] === year
+  );
+  const kw = normalizeForMatch(modelKeyword);
+  const modelEntry = modelLinks.find((l) => normalizeForMatch(l.segments[2]).includes(kw)) ?? null;
+  return { modelEntry, available: modelLinks.map((l) => l.segments[2]) };
+}
+
+// Find the "Repair and Diagnosis" section on a model page (LEMON labels it
+// "Repair and Diagnosis"; older CHARM data used "Repair & Diagnosis" — match
+// both by looking for repair + diagnos in the segment name).
+async function locateRepairDiagnosis(modelEntry: LinkEntry): Promise<LinkEntry | null> {
+  const { html, finalUrl } = await fetchUrl(modelEntry.url);
+  const links = extractLinks(html, finalUrl);
+  return (
+    links.find((l) => {
+      const last = l.segments[l.segments.length - 1]?.toLowerCase() ?? "";
+      return last.includes("repair") && last.includes("diagnos");
+    }) ?? null
+  );
+}
+
+// Image references on LEMON manual pages point at HTML wrapper pages
+// (e.g. /images25/VA344587/) rather than direct .png/.jpg files. Fetch the
+// wrapper and pull out the real <img src> so vision models and clients can
+// render diagrams inline (#7/#8). Falls back to the wrapper URL on any error.
+async function resolveImageUrl(wrapperUrl: string): Promise<string> {
+  try {
+    const { html, finalUrl } = await fetchUrl(wrapperUrl);
+    return extractImageSrc(html, finalUrl) ?? wrapperUrl;
+  } catch {
+    return wrapperUrl;
+  }
+}
+
+async function resolveMarkdownImageUrls(markdown: string): Promise<string> {
+  const wrappers = findWrapperImageUrls(markdown);
+  if (wrappers.length === 0) return markdown;
+  const resolved = new Map<string, string>();
+  await Promise.all(
+    wrappers.map(async (url) => {
+      resolved.set(url, await resolveImageUrl(url));
+    })
+  );
+  return substituteImageUrls(markdown, resolved);
 }
 
 function buildServer(): McpServer {
@@ -266,19 +358,27 @@ function buildServer(): McpServer {
     "search_manuals",
     {
       description:
-        "Search for service manuals by vehicle make and optional keyword. If the query includes a 4-digit year (e.g. '2018'), only that year is searched. Otherwise the 5 most recent available years are searched. Matching ignores case, hyphens, and spaces, so 'F-150', 'F 150', and 'f150' are equivalent. Returns matching model/manual entries with URLs.",
+        "Search for service manuals by vehicle make and optional keyword. When 'year' is provided, only that year is searched. When 'year' is omitted, ALL available years are searched by default. Set 'recent_only' to true to limit the search to the 5 most recent years instead (ignored when a specific year is given). Matching ignores case, hyphens, and spaces, so 'F-150', 'F 150', and 'f150' are equivalent. Returns matching model/manual entries with URLs.",
       inputSchema: {
         make: z
           .string()
           .min(1)
           .describe('Vehicle make to search within, e.g. "Ford", "Toyota". Use list_makes to see all available makes.'),
-        query: z
+        keyword: z
           .string()
           .optional()
-          .describe('Optional search keyword. Can be a year ("2018"), model ("F-150"), engine ("V8"), or combo ("2018 F-150").'),
+          .describe('Optional keyword to filter models, e.g. "F-150", "V8", "Auxiliary Heater". When omitted (and no year given), returns the list of available years for the make.'),
+        year: z
+          .string()
+          .optional()
+          .describe('Optional 4-digit model year to scope the search, e.g. "2011". When provided, only that year is searched; when omitted, all years are searched (unless recent_only is true).'),
+        recent_only: z
+          .boolean()
+          .optional()
+          .describe('When true, limit the search to the 5 most recent years for the make instead of searching all years. Defaults to false. Ignored when a specific year is provided.'),
       },
     },
-    async ({ make, query }) => {
+    async ({ make, keyword, year, recent_only }) => {
       const { html, finalUrl } = await fetchDir(make);
       const makeLower = make.trim().toLowerCase();
       const yearEntries = extractLinks(html, finalUrl).filter(
@@ -291,7 +391,7 @@ function buildServer(): McpServer {
             {
               type: "text",
               text: JSON.stringify(
-                { make, query, results: [], note: "No years found for this make." },
+                { make, keyword: keyword ?? null, year: year ?? null, results: [], note: "No years found for this make." },
                 null,
                 2
               ),
@@ -300,7 +400,7 @@ function buildServer(): McpServer {
         };
       }
 
-      if (!query) {
+      if (!keyword && !year) {
         return {
           content: [
             {
@@ -308,14 +408,15 @@ function buildServer(): McpServer {
               text: JSON.stringify(
                 {
                   make,
-                  query: null,
+                  keyword: null,
+                  year: null,
                   results: yearEntries.map((e) => ({
                     label: e.segments[1],
                     url: e.url,
                     path: e.segments.join("/"),
                   })),
                   count: yearEntries.length,
-                  note: `Showing available years for ${make}. Provide a query with a year or model name to search for specific manuals.`,
+                  note: `Showing available years for ${make}. Provide a keyword or year to search for specific manuals.`,
                 },
                 null,
                 2
@@ -326,10 +427,8 @@ function buildServer(): McpServer {
       }
 
       let yearsToSearch: typeof yearEntries;
-      const yearMatch = query.match(/\b(19|20)\d{2}\b/);
-      if (yearMatch) {
-        const targetYear = yearMatch[0];
-        yearsToSearch = yearEntries.filter((e) => e.segments[1] === targetYear);
+      if (year) {
+        yearsToSearch = yearEntries.filter((e) => e.segments[1] === year);
         if (yearsToSearch.length === 0) {
           return {
             content: [
@@ -338,9 +437,10 @@ function buildServer(): McpServer {
                 text: JSON.stringify(
                   {
                     make,
-                    query,
+                    keyword: keyword ?? null,
+                    year,
                     results: [],
-                    note: `Year ${targetYear} not found for ${make}. Available years: ${yearEntries.map((e) => e.segments[1]).join(", ")}`,
+                    note: `Year ${year} not found for ${make}. Available years: ${yearEntries.map((e) => e.segments[1]).join(", ")}`,
                   },
                   null,
                   2
@@ -349,34 +449,35 @@ function buildServer(): McpServer {
             ],
           };
         }
-      } else {
+      } else if (recent_only) {
         yearsToSearch = [...yearEntries]
           .sort((a, b) => parseInt(a.segments[1], 10) - parseInt(b.segments[1], 10))
           .slice(-5);
+      } else {
+        yearsToSearch = yearEntries;
       }
 
-      const keyword = query.replace(/\b(19|20)\d{2}\b/, "").trim();
-      const keywordNorm = normalizeForMatch(keyword);
+      const keywordNorm = normalizeForMatch((keyword ?? "").trim());
       const results: Array<{ make: string; year: string; model: string; url: string; path: string }> = [];
       let failedPages = 0;
 
       await Promise.all(
         yearsToSearch.map(async (yearEntry) => {
           try {
-            const year = yearEntry.segments[1];
+            const entryYear = yearEntry.segments[1];
             const { html: yh, finalUrl: yu } = await fetchDir(yearEntry.segments.join("/"));
             const modelEntries = extractLinks(yh, yu).filter(
               (l) =>
                 l.segments.length === 3 &&
                 l.segments[0].toLowerCase() === makeLower &&
-                l.segments[1] === year
+                l.segments[1] === entryYear
             );
             for (const entry of modelEntries) {
               const model = entry.segments[2];
               if (!keywordNorm || normalizeForMatch(model).includes(keywordNorm)) {
                 results.push({
                   make,
-                  year,
+                  year: entryYear,
                   model,
                   url: entry.url,
                   path: entry.segments.join("/"),
@@ -395,11 +496,17 @@ function buildServer(): McpServer {
         return a.model.localeCompare(b.model);
       });
 
+      const scope =
+        year != null
+          ? `year ${year}`
+          : recent_only
+            ? "5 most recent years"
+            : `all ${yearsToSearch.length} available years`;
       const note =
         results.length === 0 && failedPages === yearsToSearch.length
           ? `Could not reach LEMON Manuals for any of ${failedPages} year(s) searched — upstream may be down. This is not a "no results" answer; do not treat it as one.`
           : results.length === 0
-            ? `No manuals found matching "${query}" for ${make}.`
+            ? `No manuals found matching "${keyword ?? ""}" for ${make}${year ? ` ${year}` : ""}.`
             : failedPages > 0
               ? `${failedPages} of ${yearsToSearch.length} year(s) could not be fetched and were skipped; results may be incomplete.`
               : undefined;
@@ -411,7 +518,10 @@ function buildServer(): McpServer {
             text: JSON.stringify(
               {
                 make,
-                query,
+                keyword: keyword ?? null,
+                year: year ?? null,
+                recent_only: !!recent_only,
+                scope,
                 results,
                 count: results.length,
                 failed_pages: failedPages,
@@ -441,11 +551,12 @@ function buildServer(): McpServer {
     },
     async ({ url }) => {
       const { html, finalUrl } = await fetchUrl(url);
+      const markdown = await resolveMarkdownImageUrls(htmlToMarkdown(html, finalUrl));
       return {
         content: [
           {
             type: "text",
-            text: htmlToMarkdown(html, finalUrl),
+            text: markdown,
           },
         ],
       };
@@ -558,6 +669,295 @@ function buildServer(): McpServer {
             ),
           },
         ],
+      };
+    }
+  );
+
+  // Tool 7: search_diagnosis
+  server.registerTool(
+    "search_diagnosis",
+    {
+      description:
+        "Search a vehicle's Repair and Diagnosis manual sections by symptom text. Crawls the Repair and Diagnosis subtree, ranks sections by keyword match density, and returns the top 3–5 matches with paths and snippets. Use this when you don't know which section covers a specific customer complaint (e.g. 'rear AC blows hot', 'knocking when cold').",
+      inputSchema: {
+        make: z.string().min(1).describe('Vehicle make, e.g. "Ford", "Toyota". Use list_makes to see all available makes.'),
+        year: z.string().min(1).describe('4-digit model year, e.g. "2011".'),
+        model: z
+          .string()
+          .min(1)
+          .describe('Model name (partial, case/hyphen/space-insensitive), e.g. "E450", "F-150", "Crown Victoria".'),
+        symptom_text: z
+          .string()
+          .min(1)
+          .describe('Symptom in plain language, e.g. "rear AC blows hot", "heater only works on high fan speed", "knocking noise under hood when cold".'),
+      },
+    },
+    async ({ make, year, model, symptom_text }) => {
+      const fail = (payload: Record<string, unknown>) => ({
+        content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+      });
+
+      const tokens = tokenizeSymptom(symptom_text);
+      if (tokens.length === 0) {
+        return fail({ make, year, model, symptom_text, results: [], note: "symptom_text produced no searchable tokens after filtering." });
+      }
+
+      const { modelEntry, available } = await locateModel(make, year, model);
+      if (!modelEntry) {
+        return fail({
+          make,
+          year,
+          model,
+          symptom_text,
+          results: [],
+          note: `No model matching "${model}" found for ${make} ${year}. Available: ${available.join(", ") || "(none)"}`,
+        });
+      }
+
+      const rdLink = await locateRepairDiagnosis(modelEntry);
+      if (!rdLink) {
+        return fail({
+          make,
+          year,
+          model: modelEntry.segments[2],
+          symptom_text,
+          results: [],
+          note: `No "Repair and Diagnosis" section found for ${modelEntry.segments[2]}.`,
+        });
+      }
+
+      const rdSegs = rdLink.segments;
+      const { html: rdHtml, finalUrl: rdUrl } = await fetchUrl(rdLink.url);
+      const rdLinks = extractLinks(rdHtml, rdUrl);
+      const isDownload = (l: LinkEntry) => /\.zip$/i.test(l.pathname) || /^\/bundle\//i.test(l.pathname);
+
+      const candidateMap = new Map<string, LinkEntry>();
+      for (const l of descendantLinks(rdLinks, rdSegs)) {
+        if (!isDownload(l)) candidateMap.set(l.pathname, l);
+      }
+
+      // Expand one level: fetch direct-child section pages to discover deeper
+      // anchors not already rendered on the R&D index page.
+      const systems = directChildren(rdLinks, rdSegs).slice(0, 20);
+      const childPages = await Promise.all(
+        systems.map(async (s) => {
+          try {
+            const { html, finalUrl } = await fetchUrl(s.url);
+            return extractLinks(html, finalUrl);
+          } catch {
+            return [] as LinkEntry[];
+          }
+        })
+      );
+      for (const links of childPages) {
+        for (const l of descendantLinks(links, rdSegs)) {
+          if (!isDownload(l) && !candidateMap.has(l.pathname)) candidateMap.set(l.pathname, l);
+        }
+      }
+
+      const candidates = [...candidateMap.values()].map((l) => {
+        const title = l.segments[l.segments.length - 1];
+        const system = l.segments[rdSegs.length] ?? title;
+        const titleScore = scoreText(title, tokens) * 3 + (system !== title ? scoreText(system, tokens) : 0);
+        return { link: l, title, system, titleScore };
+      });
+
+      const topByTitle = candidates
+        .slice()
+        .sort((a, b) => b.titleScore - a.titleScore)
+        .slice(0, 12);
+
+      interface ScoredResult {
+        section_title: string;
+        system: string;
+        relevance_score: number;
+        path: string;
+        url: string;
+        snippet: string;
+      }
+
+      let failedPages = 0;
+      const scored = (
+        await Promise.all(
+          topByTitle.map(async (c): Promise<ScoredResult | null> => {
+            try {
+              const { html, finalUrl } = await fetchUrl(c.link.url);
+              const content = htmlToMarkdown(html, finalUrl);
+              const contentHits = scoreText(content, tokens);
+              const wordCount = content.split(/\s+/).filter(Boolean).length;
+              const relevance = relevanceScore(c.titleScore, contentHits, wordCount, tokens.length);
+              if (relevance === 0) return null;
+              return {
+                section_title: c.title,
+                system: c.system,
+                relevance_score: relevance,
+                path: c.link.segments.join("/"),
+                url: c.link.url,
+                snippet: extractSnippet(content, tokens),
+              };
+            } catch {
+              failedPages++;
+              return null;
+            }
+          })
+        )
+      )
+        .filter((r): r is ScoredResult => r !== null && r.relevance_score > 0)
+        .sort((a, b) => b.relevance_score - a.relevance_score)
+        .slice(0, 5);
+
+      const note =
+        scored.length === 0 && failedPages > 0 && failedPages === topByTitle.length
+          ? `Could not reach LEMON Manuals for any of ${failedPages} candidate page(s) — upstream may be down. This is not a "no matches" answer; do not treat it as one.`
+          : scored.length === 0
+            ? "No matching sections found. Try broader symptom terms or use browse_manuals to explore the Repair and Diagnosis tree manually."
+            : failedPages > 0
+              ? `${failedPages} candidate page(s) could not be fetched and were skipped; results may be incomplete.`
+              : undefined;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                make,
+                year,
+                model: modelEntry.segments[2],
+                symptom_text,
+                results: scored,
+                count: scored.length,
+                failed_pages: failedPages,
+                note,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // Tool 8: lookup_dtc
+  server.registerTool(
+    "lookup_dtc",
+    {
+      description:
+        "Look up a Diagnostic Trouble Code (DTC) for a specific vehicle and return its description, system, module, and a direct URL to the pinpoint test — all in one call. Reduces DTC lookup from 4+ tool calls to 1. Crawls Repair and Diagnosis → systems → modules → DTC Index pages, parses the code tables, and returns the pinpoint_test_url (pass to get_manual_content) and pinpoint_test_path (pass to browse_manuals).",
+      inputSchema: {
+        make: z.string().min(1).describe('Vehicle make, e.g. "Ford", "Toyota". Use list_makes to see valid values.'),
+        year: z.string().length(4).describe('4-digit model year, e.g. "2011".'),
+        model: z
+          .string()
+          .min(1)
+          .describe('Model name (partial, case/hyphen/space-insensitive), e.g. "E450", "Crown Victoria V8-4.6L". Use search_manuals to find the exact name.'),
+        dtc_code: z.string().min(2).describe('DTC code to look up, e.g. "P0128", "B1234", "C0035". Case-insensitive.'),
+      },
+    },
+    async ({ make, year, model, dtc_code }) => {
+      const targetDtc = dtc_code.toUpperCase().trim();
+      const fail = (payload: Record<string, unknown>) => ({
+        content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+      });
+
+      const { modelEntry, available } = await locateModel(make, year, model);
+      if (!modelEntry) {
+        return fail({ error: `No model matching "${model}" found for ${make} ${year}.`, available });
+      }
+
+      const rdLink = await locateRepairDiagnosis(modelEntry);
+      if (!rdLink) {
+        return fail({ error: `No "Repair and Diagnosis" section found for ${modelEntry.segments[2]}.` });
+      }
+
+      const rdSegs = rdLink.segments;
+      const { html: rdHtml, finalUrl: rdUrl } = await fetchUrl(rdLink.url);
+      const rdLinks = extractLinks(rdHtml, rdUrl);
+      const isDtcIndex = (l: LinkEntry) =>
+        (l.segments[l.segments.length - 1] ?? "").toLowerCase().includes("dtc index");
+
+      // LEMON renders the full subtree of anchors on a section index, so DTC
+      // Index pages are usually all reachable from the R&D page directly.
+      const dtcMap = new Map<string, LinkEntry>();
+      for (const l of descendantLinks(rdLinks, rdSegs).filter(isDtcIndex)) {
+        dtcMap.set(l.pathname, l);
+      }
+
+      // Fallback: crawl direct-child system pages if none surfaced on the index.
+      if (dtcMap.size === 0) {
+        const systems = directChildren(rdLinks, rdSegs).slice(0, 25);
+        const sysPages = await Promise.all(
+          systems.map(async (s) => {
+            try {
+              const { html, finalUrl } = await fetchUrl(s.url);
+              return extractLinks(html, finalUrl);
+            } catch {
+              return [] as LinkEntry[];
+            }
+          })
+        );
+        for (const links of sysPages) {
+          for (const l of descendantLinks(links, rdSegs).filter(isDtcIndex)) {
+            dtcMap.set(l.pathname, l);
+          }
+        }
+      }
+
+      const dtcIndexLinks = [...dtcMap.values()];
+      if (dtcIndexLinks.length === 0) {
+        return fail({
+          error: `No DTC Index pages found for ${make} ${year} ${modelEntry.segments[2]}.`,
+          note: "Use browse_manuals to explore the Repair and Diagnosis tree manually.",
+        });
+      }
+
+      const MAX_DTC_PAGES = 40;
+      const truncated = dtcIndexLinks.length > MAX_DTC_PAGES;
+      const targets = dtcIndexLinks.slice(0, MAX_DTC_PAGES);
+
+      let failedPages = 0;
+      const searchResults = await Promise.all(
+        targets.map(async (entry) => {
+          try {
+            const { html, finalUrl } = await fetchUrl(entry.url);
+            const parsed = parseDtcTableHtml(html, finalUrl, targetDtc);
+            if (!parsed) return null;
+            const pinpointPath = parsed.pinpoint_test_url
+              ? pathSegments(new URL(parsed.pinpoint_test_url).pathname).join("/")
+              : "";
+            return {
+              dtc: targetDtc,
+              description: parsed.description,
+              system: parsed.system_from_table || entry.segments[rdSegs.length] || "",
+              module: entry.segments[entry.segments.length - 2] ?? "",
+              pinpoint_test_label: parsed.pinpoint_test_label,
+              pinpoint_test_url: parsed.pinpoint_test_url,
+              pinpoint_test_path: pinpointPath,
+              dtc_index_path: entry.segments.join("/"),
+            };
+          } catch {
+            failedPages++;
+            return null;
+          }
+        })
+      );
+
+      const found = searchResults.find((r) => r !== null) ?? null;
+      if (!found) {
+        const allFailed = failedPages > 0 && failedPages === targets.length;
+        return fail({
+          dtc: targetDtc,
+          error: allFailed
+            ? `Could not reach LEMON Manuals for any of ${failedPages} DTC Index page(s) — upstream may be down. This is not a "not found" answer; do not treat it as one.`
+            : `DTC ${targetDtc} not found in ${make} ${year} ${modelEntry.segments[2]} service manuals.`,
+          failed_pages: failedPages,
+          note: `Searched ${targets.length} DTC Index page(s) across: ${[...new Set(targets.map((e) => e.segments[rdSegs.length]))].filter(Boolean).join(", ")}.${truncated ? ` More than ${MAX_DTC_PAGES} DTC Index pages exist; only the first ${MAX_DTC_PAGES} were searched.` : ""}`,
+        });
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ...found, failed_pages: failedPages }, null, 2) }],
       };
     }
   );
