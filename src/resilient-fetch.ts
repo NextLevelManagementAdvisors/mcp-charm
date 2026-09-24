@@ -41,8 +41,10 @@ export interface ResilientFetcherDeps {
 // origin in failover order. A mirror that errors at the network/transport
 // level (timeout, DNS, connection refused) is remembered as "dead" for
 // `circuitBreakerMs` so subsequent requests skip straight past it instead of
-// re-paying its timeout. An HTTP status error (e.g. 404) is NOT failed over —
-// mirrors serve identical content, so another mirror would 404 too.
+// re-paying its timeout. A 4xx HTTP status (other than 429) is NOT failed
+// over — mirrors serve identical content, so another mirror would 4xx too.
+// A 5xx or 429 means this mirror is unhealthy, so it fails over like a
+// network error.
 export function createResilientFetcher(
   allowedOrigins: string[],
   userAgent: string,
@@ -86,7 +88,7 @@ export function createResilientFetcher(
         }
         return { html: await res.text(), finalUrl: candidate };
       } catch (e) {
-        if (e instanceof HttpStatusError) throw e;
+        if (e instanceof HttpStatusError && e.status < 500 && e.status !== 429) throw e;
         markDead(origin);
         lastErr = e;
       }
