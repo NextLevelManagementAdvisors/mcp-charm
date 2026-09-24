@@ -84,6 +84,22 @@ test("fetchUrl fails over to the next mirror on a network error, then circuit-br
   assert.deepEqual(calls, [ORIGINS[0], ORIGINS[1]], "mirror should be retried once the breaker resets");
 });
 
+test("fetchUrl fails over to the next mirror on a 502, then circuit-breaks the dead one", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    const origin = new URL(url).origin;
+    calls.push(origin);
+    if (origin === ORIGINS[0]) return { ok: false, status: 502 };
+    return { ok: true, text: async () => "<html>ok</html>" };
+  };
+  const { fetchUrl, isDead } = createResilientFetcher(ORIGINS, "test-ua", { fetchImpl });
+
+  const result = await fetchUrl(ORIGINS[0] + "/Ford/");
+  assert.equal(result.finalUrl, ORIGINS[1] + "/Ford/");
+  assert.deepEqual(calls, [ORIGINS[0], ORIGINS[1]]);
+  assert.ok(isDead(ORIGINS[0]), "mirror that returned 502 should be circuit-broken");
+});
+
 test("fetchDirResilient walks up to the nearest ancestor only on a 404", async () => {
   const calledPaths = [];
   const fetchDir = async (path) => {
