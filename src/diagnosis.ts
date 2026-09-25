@@ -188,27 +188,117 @@ function normalizeSinglePagePath(segments: string[]): string {
     .join("/");
 }
 
+// A "DTC ..." token: a single code ("DTC P0420"), a GM-style numeric range
+// ("DTC P0300-P0306", high side reuses the low side's letter when omitted),
+// or the "DTC P0010 To DTC P0341" section-header spelling of the same thing.
+const DTC_TOKEN_RE_SRC =
+  "\\bDTC\\s+([PBCU])([0-9A-Za-z]{3,4})(?:\\s*(?:-|to)\\s*(?:DTC\\s+)?([PBCU])?([0-9A-Za-z]{3,4}))?(?![0-9A-Za-z])";
+
+function parseTargetDtc(dtc: string): { letter: string; num: number } | null {
+  const m = /^([PBCU])([0-9A-Za-z]{3,4})$/i.exec(dtc.trim());
+  if (!m) return null;
+  // Codes' numeric part is technically hex (SAE J2012); parsing as base-16
+  // keeps ordering correct either way and lets exact-match equality work for
+  // plain-decimal-looking codes too.
+  return { letter: m[1].toUpperCase(), num: parseInt(m[2], 16) };
+}
+
+// Whether `segment` names or ranges over `target`. When `anchored` is true
+// the "DTC ..." token must start the (trimmed) segment -- the strong signal
+// used for an actual DTC folder/link name. When false, the token may appear
+// anywhere in the segment -- the weaker signal used for a broader section
+// header that just says the code lives somewhere underneath.
+function segmentMatchesDtc(
+  segment: string,
+  target: { letter: string; num: number },
+  anchored: boolean
+): boolean {
+  const s = segment.trim();
+  const re = new RegExp(DTC_TOKEN_RE_SRC, "gi");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    if (anchored && m.index !== 0) continue;
+    const loLetter = m[1].toUpperCase();
+    const hiLetter = (m[3] || loLetter).toUpperCase();
+    if (loLetter !== target.letter || hiLetter !== target.letter) continue;
+    const loNum = parseInt(m[2], 16);
+    const hiNum = m[4] !== undefined ? parseInt(m[4], 16) : loNum;
+    const from = Math.min(loNum, hiNum);
+    const to = Math.max(loNum, hiNum);
+    if (target.num >= from && target.num <= to) return true;
+  }
+  return false;
+}
+
+// Given every Single Page link found under a matched "DTC ..." folder,
+// choose the one that best represents the pinpoint test: its "Diagnostic
+// Instructions" child if present (GM-style folder with separate procedure
+// pages nested underneath, #43), else the folder's own link if the matched
+// segment is that link's last segment (Honda-style, #35), else just the
+// first candidate found.
+function pickFolderLink<T extends { segments: string[]; url: string }>(
+  folderSegs: string[],
+  candidates: T[]
+): T {
+  const instructions = candidates.find(
+    (c) =>
+      c.segments.length === folderSegs.length + 1 &&
+      /^diagnostic instructions$/i.test((c.segments[folderSegs.length] ?? "").trim())
+  );
+  if (instructions) return instructions;
+
+  const folderItself = candidates.find((c) => c.segments.length === folderSegs.length);
+  if (folderItself) return folderItself;
+
+  return candidates[0];
+}
+
 // Some manufacturers (Honda) never list a code in any DTC Index table at
 // all -- it only shows up as a pinpoint-test folder name under the "Repair
 // and Diagnosis (Single Page)" listing, split one folder per engine/system
-// variant (e.g. "DTC P0420: ... (K24Z7)" vs. "... (Except K24Z7)"). Match
-// links whose last path segment names the code directly ("DTC P0420: ...",
-// "DTC P0420 - ...", "DTC P0420 ..."), and return every match rather than
-// just the first, since a single code can legitimately have several
-// variant-specific pinpoint tests.
+// variant (e.g. "DTC P0420: ... (K24Z7)" vs. "... (Except K24Z7)"). Others
+// (GM) group several codes under one range folder nested mid-path, not as
+// the link's last segment at all (e.g. ".../DTC P0300-P0306: Engine Misfire
+// Cylinders 1-6/Diagnostic Instructions/", #43). Match any segment naming or
+// ranging over the code, collapse every link sharing that matched folder
+// down to a single best pinpoint link (see pickFolderLink), and return every
+// distinct matching folder rather than just the first, since a single code
+// can legitimately have several variant-specific pinpoint tests.
 export function findDtcLinksOnSinglePage(
   links: { segments: string[]; url: string }[],
   targetDtc: string
 ): SinglePageDtcMatch[] {
-  const code = targetDtc.toUpperCase().trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^dtc\\s+${code}(?:[:\\-]|\\s|$)`, "i");
-  return links
-    .filter((l) => re.test((l.segments[l.segments.length - 1] ?? "").trim()))
-    .map((l) => ({
-      label: l.segments[l.segments.length - 1],
-      url: l.url,
-      path: normalizeSinglePagePath(l.segments),
-    }));
+  const target = parseTargetDtc(targetDtc);
+  if (!target) return [];
+
+  // Prefer folders/links whose own name matches (anchored); only fall back
+  // to a broader "DTC X To DTC Y" section header elsewhere in the path
+  // (unanchored) when nothing anchored matched anywhere.
+  for (const anchored of [true, false]) {
+    const folders = new Map<
+      string,
+      { label: string; folderSegs: string[]; candidates: { segments: string[]; url: string }[] }
+    >();
+
+    for (const link of links) {
+      const matchIdx = link.segments.findIndex((seg) => segmentMatchesDtc(seg, target, anchored));
+      if (matchIdx === -1) continue;
+      const folderSegs = link.segments.slice(0, matchIdx + 1);
+      const key = folderSegs.join("/");
+      const entry = folders.get(key) ?? { label: link.segments[matchIdx], folderSegs, candidates: [] };
+      entry.candidates.push(link);
+      folders.set(key, entry);
+    }
+
+    if (folders.size === 0) continue;
+
+    return [...folders.values()].map(({ label, folderSegs, candidates }) => {
+      const chosen = pickFolderLink(folderSegs, candidates);
+      return { label, url: chosen.url, path: normalizeSinglePagePath(chosen.segments) };
+    });
+  }
+
+  return [];
 }
 
 export interface DtcIndexResult {
