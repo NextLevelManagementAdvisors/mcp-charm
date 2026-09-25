@@ -69,11 +69,13 @@ export function extractFigures(html: string, baseUrl: string): Figure[] {
     let caption = (attr(tag, "alt") || attr(tag, "title") || "").trim();
     if (!caption) {
       try {
-        caption = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+        const pathname = new URL(url).pathname.replace(/\/+$/, "");
+        caption = decodeURIComponent(pathname.split("/").pop() || "");
       } catch {
         caption = "";
       }
     }
+    if (!caption) caption = `Figure ${out.length + 1}`;
     out.push({ url, caption });
   }
   return out;
