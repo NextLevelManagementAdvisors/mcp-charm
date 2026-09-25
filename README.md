@@ -4,7 +4,7 @@ MCP server for [LEMON Manuals](https://lemon-manuals.la) — free car service/wo
 
 Fork of [Gonzih/mcp-charm](https://github.com/Gonzih/mcp-charm) (MIT). Changes from upstream:
 
-- Targets LEMON Manuals with automatic mirror failover (lemon-manuals.la → .org.ua → .gy)
+- Targets LEMON Manuals with automatic mirror failover (lemon.dogeware.me → lemon-manuals.la → .org.ua → .gy — the latter three all share one host, so they're really one point of failure)
 - Direct HTML fetch and parse (removed the r.jina.ai proxy dependency)
 - Streamable HTTP transport with optional bearer-token auth (stdio remains the default)
 - Dockerfile for containerized deployment
@@ -38,7 +38,7 @@ Bundled skills are also exposed as `skill://<name>` resources for clients that r
 
 ## Environment
 
-- `LEMON_BASE_URLS` — comma-separated mirror list (default: `https://lemon-manuals.la,https://lemon-manuals.org.ua,https://lemon-manuals.gy`)
+- `LEMON_BASE_URLS` — comma-separated mirror list (default: `https://lemon.dogeware.me,https://lemon-manuals.la,https://lemon-manuals.org.ua,https://lemon-manuals.gy`)
 - `MCP_AUTH_TOKEN` — if set, HTTP mode requires the token via `Authorization: Bearer <token>` header **or** `?token=<token>` query param
 - `PORT` — HTTP port (default `8080`)
 - `MCP_TRANSPORT` — `http` or `stdio` (default `stdio`; CLI arg `http` also works)

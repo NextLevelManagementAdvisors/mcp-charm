@@ -36,9 +36,11 @@ const VERSION: string = JSON.parse(readFileSync(join(HERE, "..", "package.json")
 const UA = `lemon-mcp/${VERSION} (https://github.com/NextLevelManagementAdvisors/mcp-charm)`;
 
 // LEMON mirrors, in failover order. Override with LEMON_BASE_URLS (comma-separated).
+// lemon-manuals.la/.org.ua/.gy all share one host (AS6698); lemon.dogeware.me is an
+// independent third-party mirror and goes first so a dead host doesn't break fresh deploys.
 const BASES: string[] = (
   process.env.LEMON_BASE_URLS ??
-  "https://lemon-manuals.la,https://lemon-manuals.org.ua,https://lemon-manuals.gy"
+  "https://lemon.dogeware.me,https://lemon-manuals.la,https://lemon-manuals.org.ua,https://lemon-manuals.gy"
 )
   .split(",")
   .map((s) => s.trim().replace(/\/+$/, ""))
