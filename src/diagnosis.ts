@@ -145,6 +145,60 @@ export function parseDtcTableHtml(
   return null;
 }
 
+// --- Honda-style "DTC Index" folder pages (#35) ------------------------------
+
+// A DTC code cell always looks like a bare code: "P0420", "B1242", "U0100".
+const DTC_CODE_CELL_RE = /^[PBCU][0-9A-Za-z]{4}$/i;
+
+// Whether a "DTC Index" page's tables contain at least one row that looks
+// like a real DTC code entry, regardless of which code. Some manufacturers
+// (Honda) render a "DTC Index" page that's actually just a folder of links
+// to per-system sub-pages (e.g. "Engine Control / Transmission Control
+// Systems DTCS"), with no code table of its own -- the real tables live one
+// level down. Callers use this to tell the two apart and fall back to
+// fetching the linked sub-pages instead of reporting a false "not found".
+export function dtcIndexHasRows(html: string): boolean {
+  const tables = html.match(/<table[\s\S]*?<\/table>/gi) ?? [];
+  for (const table of tables) {
+    const rows = table.match(/<tr[\s\S]*?<\/tr>/gi) ?? [];
+    for (const tr of rows) {
+      const cells = parseCells(tr);
+      if (cells.length === 0) continue;
+      if (DTC_CODE_CELL_RE.test(cellText(cells[0]))) return true;
+    }
+  }
+  return false;
+}
+
+export interface SinglePageDtcMatch {
+  label: string;
+  url: string;
+  path: string;
+}
+
+// Some manufacturers (Honda) never list a code in any DTC Index table at
+// all -- it only shows up as a pinpoint-test folder name under the "Repair
+// and Diagnosis (Single Page)" listing, split one folder per engine/system
+// variant (e.g. "DTC P0420: ... (K24Z7)" vs. "... (Except K24Z7)"). Match
+// links whose last path segment names the code directly ("DTC P0420: ...",
+// "DTC P0420 - ...", "DTC P0420 ..."), and return every match rather than
+// just the first, since a single code can legitimately have several
+// variant-specific pinpoint tests.
+export function findDtcLinksOnSinglePage(
+  links: { segments: string[]; url: string }[],
+  targetDtc: string
+): SinglePageDtcMatch[] {
+  const code = targetDtc.toUpperCase().trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^dtc\\s+${code}(?:[:\\-]|\\s|$)`, "i");
+  return links
+    .filter((l) => re.test((l.segments[l.segments.length - 1] ?? "").trim()))
+    .map((l) => ({
+      label: l.segments[l.segments.length - 1],
+      url: l.url,
+      path: l.segments.join("/"),
+    }));
+}
+
 // --- Symptom scoring (search_diagnosis) --------------------------------------
 
 // Tokenize a plain-language symptom into searchable keyword tokens, dropping

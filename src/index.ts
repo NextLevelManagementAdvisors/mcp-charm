@@ -26,10 +26,14 @@ import {
   substituteImageUrls,
   extractImageSrc,
   parseDtcTableHtml,
+  dtcIndexHasRows,
+  findDtcLinksOnSinglePage,
   tokenizeSymptom,
   scoreText,
   relevanceScore,
   extractSnippet,
+  type ParsedDtcRow,
+  type SinglePageDtcMatch,
 } from "./diagnosis.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -190,6 +194,87 @@ async function locateRepairDiagnosis(modelEntry: LinkEntry): Promise<LinkEntry |
       return last.includes("repair") && last.includes("diagnos");
     }) ?? null
   );
+}
+
+// Same lookup as locateRepairDiagnosis, but for the "(Single Page)" variant
+// that renders the whole Repair and Diagnosis subtree as one flat listing of
+// anchors (used as a fallback in lookup_dtc, #35).
+async function locateRepairDiagnosisSinglePage(modelEntry: LinkEntry): Promise<LinkEntry | null> {
+  const { html, finalUrl } = await fetchUrl(modelEntry.url);
+  const links = extractLinks(html, finalUrl);
+  return (
+    links.find((l) => {
+      const last = l.segments[l.segments.length - 1]?.toLowerCase() ?? "";
+      return last.includes("repair") && last.includes("diagnos") && last.includes("single page");
+    }) ?? null
+  );
+}
+
+function buildDtcResult(entry: LinkEntry, parsed: ParsedDtcRow, rdSegsLen: number, targetDtc: string) {
+  const pinpointPath = parsed.pinpoint_test_url
+    ? pathSegments(new URL(parsed.pinpoint_test_url).pathname).join("/")
+    : "";
+  return {
+    dtc: targetDtc,
+    description: parsed.description,
+    system: parsed.system_from_table || entry.segments[rdSegsLen] || "",
+    module: entry.segments[entry.segments.length - 2] ?? "",
+    pinpoint_test_label: parsed.pinpoint_test_label,
+    pinpoint_test_url: parsed.pinpoint_test_url,
+    pinpoint_test_path: pinpointPath,
+    dtc_index_path: entry.segments.join("/"),
+  };
+}
+
+// Search a single "DTC Index" page for `targetDtc`. Some manufacturers
+// (Honda) render that page as a folder of per-system sub-pages instead of a
+// code table -- when the page itself has no DTC rows at all, follow its
+// direct children one level and parse those too (#35, cheap fix).
+async function searchDtcIndexEntry(
+  entry: LinkEntry,
+  targetDtc: string,
+  rdSegsLen: number
+): Promise<ReturnType<typeof buildDtcResult> | null> {
+  const { html, finalUrl } = await fetchUrl(entry.url);
+  const parsed = parseDtcTableHtml(html, finalUrl, targetDtc);
+  if (parsed) return buildDtcResult(entry, parsed, rdSegsLen, targetDtc);
+  if (dtcIndexHasRows(html)) return null;
+
+  const children = directChildren(extractLinks(html, finalUrl), entry.segments).slice(0, 20);
+  const childResults = await Promise.all(
+    children.map(async (child) => {
+      try {
+        const { html: childHtml, finalUrl: childUrl } = await fetchUrl(child.url);
+        const childParsed = parseDtcTableHtml(childHtml, childUrl, targetDtc);
+        return childParsed ? buildDtcResult(child, childParsed, rdSegsLen, targetDtc) : null;
+      } catch {
+        return null;
+      }
+    })
+  );
+  return childResults.find((r) => r !== null) ?? null;
+}
+
+// Fallback when no DTC Index table (even after following one level of
+// sub-pages) contains the code: some manufacturers (Honda) split a code
+// across several per-variant pinpoint-test folders that never appear in any
+// DTC Index table -- they only show up as folder names on the "Repair and
+// Diagnosis (Single Page)" listing, e.g. "DTC P0420: ... (K24Z7)" vs.
+// "... (Except K24Z7)". Return every match found there (#35).
+async function trySinglePageFallback(
+  modelEntry: LinkEntry,
+  targetDtc: string
+): Promise<{ dtc: string; pinpoint_tests: SinglePageDtcMatch[]; note: string } | null> {
+  const singlePageLink = await locateRepairDiagnosisSinglePage(modelEntry);
+  if (!singlePageLink) return null;
+  const { html, finalUrl } = await fetchUrl(singlePageLink.url);
+  const matches = findDtcLinksOnSinglePage(extractLinks(html, finalUrl), targetDtc);
+  if (matches.length === 0) return null;
+  return {
+    dtc: targetDtc,
+    pinpoint_tests: matches,
+    note: `Found via "Repair and Diagnosis (Single Page)" fallback (${matches.length} matching link(s) -- some manufacturers split one code across multiple engine/system variants; check each label to find the one that applies).`,
+  };
 }
 
 // Image references on LEMON manual pages point at HTML wrapper pages
@@ -877,7 +962,7 @@ function buildServer(): McpServer {
     "lookup_dtc",
     {
       description:
-        "Look up a Diagnostic Trouble Code (DTC) for a specific vehicle and return its description, system, module, and a direct URL to the pinpoint test — all in one call. Reduces DTC lookup from 4+ tool calls to 1. Crawls Repair and Diagnosis → systems → modules → DTC Index pages, parses the code tables, and returns the pinpoint_test_url (pass to get_manual_content) and pinpoint_test_path (pass to browse_manuals).",
+        "Look up a Diagnostic Trouble Code (DTC) for a specific vehicle and return its description, system, module, and a direct URL to the pinpoint test — all in one call. Reduces DTC lookup from 4+ tool calls to 1. Crawls Repair and Diagnosis → systems → modules → DTC Index pages, parses the code tables, and returns the pinpoint_test_url (pass to get_manual_content) and pinpoint_test_path (pass to browse_manuals). If a DTC Index page has no table of its own, its per-system sub-pages are searched too. If the code still isn't found in any table (some manufacturers split a code across multiple engine/system variants, e.g. Honda), falls back to the 'Repair and Diagnosis (Single Page)' listing and returns every matching variant as pinpoint_tests[] instead of a single result.",
       inputSchema: {
         make: z.string().min(1).describe('Vehicle make, e.g. "Ford", "Toyota". Use list_makes to see valid values.'),
         year: z.string().length(4).describe('4-digit model year, e.g. "2011".'),
@@ -953,22 +1038,7 @@ function buildServer(): McpServer {
       const searchResults = await Promise.all(
         targets.map(async (entry) => {
           try {
-            const { html, finalUrl } = await fetchUrl(entry.url);
-            const parsed = parseDtcTableHtml(html, finalUrl, targetDtc);
-            if (!parsed) return null;
-            const pinpointPath = parsed.pinpoint_test_url
-              ? pathSegments(new URL(parsed.pinpoint_test_url).pathname).join("/")
-              : "";
-            return {
-              dtc: targetDtc,
-              description: parsed.description,
-              system: parsed.system_from_table || entry.segments[rdSegs.length] || "",
-              module: entry.segments[entry.segments.length - 2] ?? "",
-              pinpoint_test_label: parsed.pinpoint_test_label,
-              pinpoint_test_url: parsed.pinpoint_test_url,
-              pinpoint_test_path: pinpointPath,
-              dtc_index_path: entry.segments.join("/"),
-            };
+            return await searchDtcIndexEntry(entry, targetDtc, rdSegs.length);
           } catch {
             failedPages++;
             return null;
@@ -979,13 +1049,23 @@ function buildServer(): McpServer {
       const found = searchResults.find((r) => r !== null) ?? null;
       if (!found) {
         const allFailed = failedPages > 0 && failedPages === targets.length;
+        if (!allFailed) {
+          const singlePageResult = await trySinglePageFallback(modelEntry, targetDtc).catch(() => null);
+          if (singlePageResult) {
+            return {
+              content: [
+                { type: "text", text: JSON.stringify({ ...singlePageResult, failed_pages: failedPages }, null, 2) },
+              ],
+            };
+          }
+        }
         return fail({
           dtc: targetDtc,
           error: allFailed
             ? `Could not reach LEMON Manuals for any of ${failedPages} DTC Index page(s) — upstream may be down. This is not a "not found" answer; do not treat it as one.`
             : `DTC ${targetDtc} not found in ${make} ${year} ${modelEntry.segments[2]} service manuals.`,
           failed_pages: failedPages,
-          note: `Searched ${targets.length} DTC Index page(s) across: ${[...new Set(targets.map((e) => e.segments[rdSegs.length]))].filter(Boolean).join(", ")}.${truncated ? ` More than ${MAX_DTC_PAGES} DTC Index pages exist; only the first ${MAX_DTC_PAGES} were searched.` : ""}`,
+          note: `Searched ${targets.length} DTC Index page(s) (including per-system sub-pages) and the "Repair and Diagnosis (Single Page)" listing, across: ${[...new Set(targets.map((e) => e.segments[rdSegs.length]))].filter(Boolean).join(", ")}.${truncated ? ` More than ${MAX_DTC_PAGES} DTC Index pages exist; only the first ${MAX_DTC_PAGES} were searched.` : ""}`,
         });
       }
 
