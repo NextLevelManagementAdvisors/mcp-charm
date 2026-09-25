@@ -17,7 +17,15 @@ Build OEM-sourced labor estimates. Always pull times from the manual — never g
 | Confirmed repair(s) | From dx session or user |
 | Labor rate (dollar/hr) | From session config or user |
 
-## Step 1 — Navigate to Labor Times
+## Step 1 — Look Up Labor Times
+
+Call `lookup_labor_time` first — it searches the whole Labor Times subtree in one shot and automatically follows the Other Variant redirect when the exact trim has no published times of its own:
+
+Vehicle manuals:lookup_labor_time(make=<make>, year=<year>, model=<model>, component="<component keyword>", operation="<optional operation keyword>")
+
+If the result reports a `variant_used`, note that the times came from a related trim/variant and say so in the estimate.
+
+Fall back to manual browsing only if `lookup_labor_time` returns no matches or the component keyword is too ambiguous to search:
 
 Vehicle manuals:browse_manuals(<base_path>/Labor Times)
 
@@ -32,9 +40,9 @@ Vehicle manuals:search_manuals(make=<make>, year=<year>, keyword="<component> la
 
 ## Step 2 — Extract Labor Operations
 
-Fetch the labor page: Vehicle manuals:get_manual_content(<labor_page_path>)
+If you fell back to browsing, fetch the labor page: Vehicle manuals:get_manual_content(<labor_page_path>)
 
-The page will list operations with times. Extract:
+The page (or the `lookup_labor_time` result) will list operations with times. Extract:
 
 | Operation | OEM Code | Time (hr) |
 |-----------|----------|-----------|
@@ -64,24 +72,24 @@ VIN: [VIN]
 Date: [today]
 
 DIAGNOSIS
-  [System] Diagnosis          [X.X hr]   0
+  [System] Diagnosis          [X.X hr]   $[amount]
 
 REPAIR
-  [Component] — R&R           [X.X hr]   0
+  [Component] — R&R           [X.X hr]   $[amount]
   [Sub-component] (included)  [0.0 hr]   included
-  Refrigerant — Recover       [X.X hr]   0
-  Refrigerant — Evac/Charge   [X.X hr]   0
+  Refrigerant — Recover       [X.X hr]   $[amount]
+  Refrigerant — Evac/Charge   [X.X hr]   $[amount]
 
 PARTS (estimate)
-  [Part name] x [qty]                    0
-  O-ring seal kit                        0
+  [Part name] x [qty]                    $[amount]
+  O-ring seal kit                        $[amount]
 
 OVERLAP CREDIT
-  [Description of shared access credit] -0
+  [Description of shared access credit] -$[amount]
 
-SUBTOTAL LABOR   [X.X hr]  0
-SUBTOTAL PARTS             0
-ESTIMATED TOTAL            0
+SUBTOTAL LABOR   [X.X hr]  $[amount]
+SUBTOTAL PARTS             $[amount]
+ESTIMATED TOTAL            $[amount]
 
 Note: Parts pricing not yet confirmed. Estimate based on OEM labor times.
 
