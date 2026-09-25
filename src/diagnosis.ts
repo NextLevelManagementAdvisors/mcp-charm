@@ -176,6 +176,18 @@ export interface SinglePageDtcMatch {
   path: string;
 }
 
+// The "Single Page" listing renders the whole Repair and Diagnosis subtree
+// under one folder named "Repair and Diagnosis (Single Page)", but that
+// folder doesn't exist as its own page -- everything under it is also
+// reachable under the plain "Repair and Diagnosis" tree. Rewrite that one
+// segment so returned `path` values stay consistent with what browse_manuals
+// and get_manual_content otherwise report (#41).
+function normalizeSinglePagePath(segments: string[]): string {
+  return segments
+    .map((s) => (s.toLowerCase() === "repair and diagnosis (single page)" ? "Repair and Diagnosis" : s))
+    .join("/");
+}
+
 // Some manufacturers (Honda) never list a code in any DTC Index table at
 // all -- it only shows up as a pinpoint-test folder name under the "Repair
 // and Diagnosis (Single Page)" listing, split one folder per engine/system
@@ -195,8 +207,45 @@ export function findDtcLinksOnSinglePage(
     .map((l) => ({
       label: l.segments[l.segments.length - 1],
       url: l.url,
-      path: l.segments.join("/"),
+      path: normalizeSinglePagePath(l.segments),
     }));
+}
+
+export interface DtcIndexResult {
+  dtc: string;
+  description: string;
+  system: string;
+  module: string;
+  pinpoint_test_label: string;
+  pinpoint_test_url: string;
+  pinpoint_test_path: string;
+  dtc_index_path: string;
+  pinpoint_tests?: SinglePageDtcMatch[];
+  note?: string;
+}
+
+// Some DTC Index table rows (Honda) name the code and its description but
+// leave the pinpoint-test cell empty or link-less -- the real pinpoint test
+// links only exist as per-variant folders on the "Repair and Diagnosis
+// (Single Page)" listing (see findDtcLinksOnSinglePage above). When that's
+// the case, merge those links into the index-table hit instead of returning
+// it with an empty pinpoint_test_url: fill pinpoint_test_url/_path from the
+// first match, and attach every match as pinpoint_tests[] so callers still
+// see every engine/system variant (#41).
+export function mergeSinglePageMatches(
+  found: DtcIndexResult,
+  matches: SinglePageDtcMatch[]
+): DtcIndexResult {
+  if (matches.length === 0) return found;
+  const [first] = matches;
+  return {
+    ...found,
+    pinpoint_test_label: found.pinpoint_test_label || first.label,
+    pinpoint_test_url: first.url,
+    pinpoint_test_path: first.path,
+    pinpoint_tests: matches,
+    note: `Index table row for ${found.dtc} had no pinpoint test link; merged in ${matches.length} matching link(s) from the "Repair and Diagnosis (Single Page)" listing -- some manufacturers split one code across multiple engine/system variants; check each label to find the one that applies.`,
+  };
 }
 
 // --- Symptom scoring (search_diagnosis) --------------------------------------
