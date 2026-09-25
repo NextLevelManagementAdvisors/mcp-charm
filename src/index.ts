@@ -28,6 +28,7 @@ import {
   parseDtcTableHtml,
   dtcIndexHasRows,
   findDtcLinksOnSinglePage,
+  mergeSinglePageMatches,
   tokenizeSymptom,
   scoreText,
   relevanceScore,
@@ -1047,6 +1048,21 @@ function buildServer(): McpServer {
       );
 
       const found = searchResults.find((r) => r !== null) ?? null;
+
+      // Some DTC Index rows (Honda) name the code but leave the pinpoint-test
+      // cell empty/link-less -- the real pinpoint tests only show up as
+      // per-variant folders on the Single Page listing. Merge those in
+      // instead of returning the row with an empty pinpoint_test_url (#41).
+      if (found && !found.pinpoint_test_url) {
+        const singlePageResult = await trySinglePageFallback(modelEntry, targetDtc).catch(() => null);
+        if (singlePageResult) {
+          const merged = mergeSinglePageMatches(found, singlePageResult.pinpoint_tests);
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ...merged, failed_pages: failedPages }, null, 2) }],
+          };
+        }
+      }
+
       if (!found) {
         const allFailed = failedPages > 0 && failedPages === targets.length;
         if (!allFailed) {

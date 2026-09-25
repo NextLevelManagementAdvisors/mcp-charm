@@ -7,6 +7,7 @@ import {
   parseDtcTableHtml,
   dtcIndexHasRows,
   findDtcLinksOnSinglePage,
+  mergeSinglePageMatches,
   tokenizeSymptom,
   scoreText,
   relevanceScore,
@@ -156,6 +157,29 @@ const HONDA_CIVIC_SINGLE_PAGE = `
 </ul>
 `;
 
+// #41: live 2015 Civic LX P0420 lookup -- the per-system sub-page table has a
+// row for P0420, but (unlike the #35 fixture above) its pinpoint-test cell is
+// empty. The real pinpoint tests only exist as the two per-variant folders on
+// the Single Page listing.
+const HONDA_CIVIC_ENGINE_CONTROL_DTCS_NO_LINK = `
+<h1>Engine Control / Transmission Control Systems DTCS</h1>
+<table>
+  <tr><th>DTC</th><th>Description</th><th>System</th><th>Pinpoint Test</th></tr>
+  <tr>
+    <td>P0301</td>
+    <td>Cylinder 1 Misfire Detected</td>
+    <td>Engine Control</td>
+    <td><a href="../../Troubleshooting/DTC%20P0301/">Go to Pinpoint Test</a></td>
+  </tr>
+  <tr>
+    <td>P0420</td>
+    <td>Catalyst System Efficiency Below Threshold</td>
+    <td>Engine Control</td>
+    <td></td>
+  </tr>
+</table>
+`;
+
 test("dtcIndexHasRows is false for a folder-of-sub-pages DTC Index page (Honda Civic)", () => {
   assert.equal(dtcIndexHasRows(HONDA_CIVIC_DTC_INDEX_FOLDER), false);
 });
@@ -223,6 +247,92 @@ test("findDtcLinksOnSinglePage does not partial-match a different code with the 
   const matches = findDtcLinksOnSinglePage(links, "P0420");
   assert.equal(matches.length, 1);
   assert.equal(matches[0].label, "DTC P0420-A Variant Note");
+});
+
+test("findDtcLinksOnSinglePage rewrites the (Single Page) segment to a plain Repair and Diagnosis path (#41)", () => {
+  const links = [
+    {
+      segments: [
+        "Honda", "2015", "Civic LX, 4D Sedan, Automatic CVT Trans", "Repair and Diagnosis (Single Page)",
+        "Engine Performance", "System", "Engine Control System - Diagnostic Codes (P0365-P0641) (Except Hybrid)",
+        "Troubleshooting", "DTC P0420: Catalyst System Efficiency Below Threshold (K24Z7)",
+      ],
+      url: "https://lemon-manuals.la/Honda/2015/.../DTC%20P0420%3A%20Catalyst%20System%20Efficiency%20Below%20Threshold%20(K24Z7)/",
+    },
+  ];
+  const [match] = findDtcLinksOnSinglePage(links, "P0420");
+  assert.equal(
+    match.path,
+    "Honda/2015/Civic LX, 4D Sedan, Automatic CVT Trans/Repair and Diagnosis/Engine Performance/System/Engine Control System - Diagnostic Codes (P0365-P0641) (Except Hybrid)/Troubleshooting/DTC P0420: Catalyst System Efficiency Below Threshold (K24Z7)"
+  );
+});
+
+// #41: live lookup_dtc bug -- the Honda index-table row for P0420 is found
+// (so the whole-table Single Page fallback in index.ts never used to run),
+// but its pinpoint-test cell is empty. lookup_dtc is expected to still scan
+// the Single Page listing in that case and merge the results in, so the user
+// gets both engine/system variants instead of nothing.
+
+test("parseDtcTableHtml returns an empty pinpoint_test_url when the index row has no link (#41)", () => {
+  const parsed = parseDtcTableHtml(
+    HONDA_CIVIC_ENGINE_CONTROL_DTCS_NO_LINK,
+    "https://lemon-manuals.la/Honda/2015/Civic%20LX%2C%204D%20Sedan%2C%20Automatic%20CVT%20Trans/Repair%20and%20Diagnosis/Quick%20Lookups/DTC%20Index%20(Except%20Hybrid)/Engine%20Control%20%2F%20Transmission%20Control%20Systems%20DTCS/",
+    "P0420"
+  );
+  assert.ok(parsed);
+  assert.equal(parsed.description, "Catalyst System Efficiency Below Threshold");
+  assert.equal(parsed.pinpoint_test_url, "");
+});
+
+test("mergeSinglePageMatches fills in pinpoint_test_url/_path and attaches every variant when the index row had no link (#41)", () => {
+  const found = {
+    dtc: "P0420",
+    description: "Catalyst System Efficiency Below Threshold",
+    system: "Engine Control",
+    module: "Quick Lookups",
+    pinpoint_test_label: "",
+    pinpoint_test_url: "",
+    pinpoint_test_path: "",
+    dtc_index_path:
+      "Honda/2015/Civic LX, 4D Sedan, Automatic CVT Trans/Repair and Diagnosis/Quick Lookups/DTC Index (Except Hybrid)/Engine Control / Transmission Control Systems DTCS",
+  };
+
+  const singlePageLinks = [
+    {
+      segments: [
+        "Honda", "2015", "Civic LX, 4D Sedan, Automatic CVT Trans", "Repair and Diagnosis (Single Page)",
+        "Engine Performance", "System", "Engine Control System - Diagnostic Codes (P0365-P0641) (Except Hybrid)",
+        "Troubleshooting", "DTC P0420: Catalyst System Efficiency Below Threshold (K24Z7)",
+      ],
+      url: "https://lemon-manuals.la/Honda/2015/.../DTC%20P0420%3A%20Catalyst%20System%20Efficiency%20Below%20Threshold%20(K24Z7)/",
+    },
+    {
+      segments: [
+        "Honda", "2015", "Civic LX, 4D Sedan, Automatic CVT Trans", "Repair and Diagnosis (Single Page)",
+        "Engine Performance", "System", "Engine Control System - Diagnostic Codes (P0365-P0641) (Except Hybrid)",
+        "Troubleshooting", "DTC P0420: Catalyst System Efficiency Below Threshold (Except K24Z7)",
+      ],
+      url: "https://lemon-manuals.la/Honda/2015/.../DTC%20P0420%3A%20Catalyst%20System%20Efficiency%20Below%20Threshold%20(Except%20K24Z7)/",
+    },
+  ];
+  const matches = findDtcLinksOnSinglePage(singlePageLinks, "P0420");
+  assert.equal(matches.length, 2);
+
+  const merged = mergeSinglePageMatches(found, matches);
+  assert.equal(merged.pinpoint_test_url, matches[0].url);
+  assert.ok(merged.pinpoint_test_url.includes("K24Z7"));
+  assert.equal(merged.pinpoint_test_path, matches[0].path);
+  assert.equal(merged.pinpoint_tests.length, 2);
+  assert.ok(merged.pinpoint_tests.every((m) => m.label.startsWith("DTC P0420")));
+  assert.match(merged.note, /merged in 2 matching link/i);
+  // Index-table fields (description/system/etc.) are preserved, not clobbered.
+  assert.equal(merged.description, found.description);
+  assert.equal(merged.dtc, "P0420");
+});
+
+test("mergeSinglePageMatches leaves the result unchanged when there are no Single Page matches", () => {
+  const found = { dtc: "P0420", pinpoint_test_url: "", pinpoint_test_path: "" };
+  assert.deepEqual(mergeSinglePageMatches(found, []), found);
 });
 
 // --- #10: symptom scoring ----------------------------------------------------
