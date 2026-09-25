@@ -19,6 +19,7 @@ import {
   type LinkEntry,
 } from "./browse-links.js";
 import { parseLaborLeaf, type LaborTimeRow } from "./labor-parser.js";
+import { resolveLegacyQuery } from "./query-alias.js";
 import { createResilientFetcher, fetchDirResilient as fetchDirResilientCore } from "./resilient-fetch.js";
 import {
   findWrapperImageUrls,
@@ -378,9 +379,22 @@ function buildServer(): McpServer {
           .boolean()
           .optional()
           .describe('When true, limit the search to the 5 most recent years for the make instead of searching all years. Defaults to false. Ignored when a specific year is provided.'),
+        query: z
+          .string()
+          .optional()
+          .describe(
+            'Deprecated alias for keyword/year, kept for clients using an older cached tool schema. A 4-digit year found anywhere in the string is extracted into "year"; the remainder is used as "keyword". Ignored for any part where "keyword" or "year" is also given directly. Prefer passing "keyword" and "year" instead.'
+          ),
       },
     },
-    async ({ make, keyword, year, recent_only }) => {
+    async ({ make, keyword, year, recent_only, query }) => {
+      let legacyQueryNote: string | undefined;
+      if (query) {
+        const resolved = resolveLegacyQuery(query);
+        if (keyword === undefined) keyword = resolved.keyword;
+        if (year === undefined) year = resolved.year;
+        legacyQueryNote = "query is deprecated; use keyword/year";
+      }
       const { html, finalUrl } = await fetchDir(make);
       const makeLower = make.trim().toLowerCase();
       const yearEntries = extractLinks(html, finalUrl).filter(
@@ -393,7 +407,13 @@ function buildServer(): McpServer {
             {
               type: "text",
               text: JSON.stringify(
-                { make, keyword: keyword ?? null, year: year ?? null, results: [], note: "No years found for this make." },
+                {
+                  make,
+                  keyword: keyword ?? null,
+                  year: year ?? null,
+                  results: [],
+                  note: [legacyQueryNote, "No years found for this make."].filter(Boolean).join(" "),
+                },
                 null,
                 2
               ),
@@ -418,7 +438,12 @@ function buildServer(): McpServer {
                     path: e.segments.join("/"),
                   })),
                   count: yearEntries.length,
-                  note: `Showing available years for ${make}. Provide a keyword or year to search for specific manuals.`,
+                  note: [
+                    legacyQueryNote,
+                    `Showing available years for ${make}. Provide a keyword or year to search for specific manuals.`,
+                  ]
+                    .filter(Boolean)
+                    .join(" "),
                 },
                 null,
                 2
@@ -442,7 +467,12 @@ function buildServer(): McpServer {
                     keyword: keyword ?? null,
                     year,
                     results: [],
-                    note: `Year ${year} not found for ${make}. Available years: ${yearEntries.map((e) => e.segments[1]).join(", ")}`,
+                    note: [
+                      legacyQueryNote,
+                      `Year ${year} not found for ${make}. Available years: ${yearEntries.map((e) => e.segments[1]).join(", ")}`,
+                    ]
+                      .filter(Boolean)
+                      .join(" "),
                   },
                   null,
                   2
@@ -504,7 +534,7 @@ function buildServer(): McpServer {
           : recent_only
             ? "5 most recent years"
             : `all ${yearsToSearch.length} available years`;
-      const note =
+      const searchNote =
         results.length === 0 && failedPages === yearsToSearch.length
           ? `Could not reach LEMON Manuals for any of ${failedPages} year(s) searched — upstream may be down. This is not a "no results" answer; do not treat it as one.`
           : results.length === 0
@@ -512,6 +542,7 @@ function buildServer(): McpServer {
             : failedPages > 0
               ? `${failedPages} of ${yearsToSearch.length} year(s) could not be fetched and were skipped; results may be incomplete.`
               : undefined;
+      const note = [legacyQueryNote, searchNote].filter(Boolean).join(" ") || undefined;
 
       return {
         content: [
