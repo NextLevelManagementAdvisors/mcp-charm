@@ -335,6 +335,105 @@ test("mergeSinglePageMatches leaves the result unchanged when there are no Singl
   assert.deepEqual(mergeSinglePageMatches(found, []), found);
 });
 
+// --- #43: GM range folders nested mid-path -----------------------------------
+// Modeled on the 2016 Chevrolet Silverado 1500 Custom, 4.3L: the "DTC
+// P0300-P0306" folder groups six misfire codes under one range, and sits in
+// the middle of the path (not as the link's last segment) -- the actual
+// pinpoint-test pages are its "Diagnostic Instructions"/"DTC Descriptors"/
+// "Circuit/System Description" children. The whole folder also sits under a
+// broader "... - DTC P0010 To DTC P0341" section header, which should NOT be
+// picked over the narrower range match.
+
+const GM_SILVERADO_SINGLE_PAGE_PREFIX = [
+  "Chevrolet",
+  "2016",
+  "Silverado 1500 Custom, 4D Pickup Crew Cab, 4.3L Eng VIN H, 4WD",
+  "Repair and Diagnosis (Single Page)",
+  "Engine Performance",
+  "System",
+  "Engine Controls And Fuel - 4.3L (LV1 LV3) - DTC P0010 To DTC P0341",
+  "Diagnostic Information and Procedures",
+  "DTC P0300-P0306: Engine Misfire Cylinders 1-6",
+];
+
+function gmSilveradoLink(childSegment) {
+  const segments = [...GM_SILVERADO_SINGLE_PAGE_PREFIX, childSegment];
+  return {
+    segments,
+    url: `https://lemon-manuals.la/${segments.map(encodeURIComponent).join("/")}/`,
+  };
+}
+
+const GM_SILVERADO_SINGLE_PAGE_LINKS = [
+  gmSilveradoLink("Diagnostic Instructions"),
+  gmSilveradoLink("DTC Descriptors"),
+  gmSilveradoLink("Circuit/System Description"),
+];
+
+const GM_SILVERADO_EXPECTED_PATH =
+  "Chevrolet/2016/Silverado 1500 Custom, 4D Pickup Crew Cab, 4.3L Eng VIN H, 4WD/Repair and Diagnosis/Engine Performance/System/Engine Controls And Fuel - 4.3L (LV1 LV3) - DTC P0010 To DTC P0341/Diagnostic Information and Procedures/DTC P0300-P0306: Engine Misfire Cylinders 1-6/Diagnostic Instructions";
+
+test("findDtcLinksOnSinglePage matches P0300, the exact start of a GM range folder, and collapses to its Diagnostic Instructions child (#43)", () => {
+  const matches = findDtcLinksOnSinglePage(GM_SILVERADO_SINGLE_PAGE_LINKS, "P0300");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].label, "DTC P0300-P0306: Engine Misfire Cylinders 1-6");
+  assert.equal(matches[0].path, GM_SILVERADO_EXPECTED_PATH);
+  assert.match(decodeURIComponent(matches[0].url), /Diagnostic Instructions\/$/);
+});
+
+test("findDtcLinksOnSinglePage matches P0303, inside a GM range folder nested mid-path (#43)", () => {
+  const matches = findDtcLinksOnSinglePage(GM_SILVERADO_SINGLE_PAGE_LINKS, "P0303");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].label, "DTC P0300-P0306: Engine Misfire Cylinders 1-6");
+  assert.equal(matches[0].path, GM_SILVERADO_EXPECTED_PATH);
+  assert.match(decodeURIComponent(matches[0].url), /Diagnostic Instructions\/$/);
+});
+
+test("findDtcLinksOnSinglePage does not match any folder for a code outside every range present", () => {
+  // Outside both the narrow P0300-P0306 folder and the broader P0010-P0341
+  // section header that contains it.
+  assert.equal(findDtcLinksOnSinglePage(GM_SILVERADO_SINGLE_PAGE_LINKS, "P0500").length, 0);
+  assert.equal(findDtcLinksOnSinglePage(GM_SILVERADO_SINGLE_PAGE_LINKS, "P0005").length, 0);
+  // Different letter prefix, same numeric range -- must not cross-match.
+  assert.equal(findDtcLinksOnSinglePage(GM_SILVERADO_SINGLE_PAGE_LINKS, "B0303").length, 0);
+});
+
+test("findDtcLinksOnSinglePage falls back to the broader section header for a code inside it but outside the narrow range", () => {
+  // P0307 is outside the narrow "DTC P0300-P0306" misfire folder but still
+  // inside the broader "... DTC P0010 To DTC P0341" section header -- the
+  // weaker signal correctly still finds it, just less precisely.
+  const matches = findDtcLinksOnSinglePage(GM_SILVERADO_SINGLE_PAGE_LINKS, "P0307");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].label, "Engine Controls And Fuel - 4.3L (LV1 LV3) - DTC P0010 To DTC P0341");
+});
+
+test("findDtcLinksOnSinglePage falls back to a broad 'DTC X To DTC Y' section header only when no narrower folder matches", () => {
+  const sectionOnly = [
+    {
+      segments: [
+        "Chevrolet", "2016", "Silverado 1500 Custom, 4D Pickup Crew Cab, 4.3L Eng VIN H, 4WD",
+        "Repair and Diagnosis (Single Page)", "Engine Performance", "System",
+        "Engine Controls And Fuel - 4.3L (LV1 LV3) - DTC P0010 To DTC P0341",
+        "Diagnostic Information and Procedures",
+      ],
+      url: "https://lemon-manuals.la/Chevrolet/2016/.../Diagnostic%20Information%20and%20Procedures/",
+    },
+  ];
+  const matches = findDtcLinksOnSinglePage(sectionOnly, "P0128");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].label, "Engine Controls And Fuel - 4.3L (LV1 LV3) - DTC P0010 To DTC P0341");
+
+  // Still respects the range's bounds.
+  assert.equal(findDtcLinksOnSinglePage(sectionOnly, "P0342").length, 0);
+
+  // The narrower GM range folder wins over this same broad section header
+  // when both are present in the link set (#43 live case).
+  const both = [...sectionOnly, ...GM_SILVERADO_SINGLE_PAGE_LINKS];
+  const preferred = findDtcLinksOnSinglePage(both, "P0303");
+  assert.equal(preferred.length, 1);
+  assert.equal(preferred[0].label, "DTC P0300-P0306: Engine Misfire Cylinders 1-6");
+});
+
 // --- #10: symptom scoring ----------------------------------------------------
 
 test("tokenizeSymptom lowercases, strips punctuation, and drops short words", () => {
